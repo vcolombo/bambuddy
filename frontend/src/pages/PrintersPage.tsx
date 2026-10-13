@@ -7717,6 +7717,13 @@ export function AddPrinterModal({
 
   const handleAddSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
+    // Moonraker machines (Snapmaker U1) don't speak the Bambu MQTT the
+    // diagnostic probes; running it would always warn. The create call's
+    // own connection test is the real gate there.
+    if (form.model === 'U1') {
+      onAdd(form);
+      return;
+    }
     setCheckingSave(true);
     try {
       const result = await api.diagnoseConnection({
@@ -8029,7 +8036,7 @@ export function AddPrinterModal({
               <label className="block text-sm text-bambu-gray mb-1">{t('printers.accessCode')}</label>
               <input
                 type="password"
-                required
+                required={form.model !== 'U1'}
                 className="w-full px-3 py-2 bg-bambu-dark border border-bambu-dark-tertiary rounded-lg text-white focus:border-bambu-green focus:outline-none"
                 value={form.access_code}
                 onChange={(e) => setForm({ ...form, access_code: e.target.value })}
@@ -8069,6 +8076,9 @@ export function AddPrinterModal({
                 </optgroup>
                 <optgroup label="X2 Series">
                   <option value="X2D">X2D</option>
+                </optgroup>
+                <optgroup label="Snapmaker">
+                  <option value="U1">Snapmaker U1</option>
                 </optgroup>
               </select>
             </div>
@@ -8600,6 +8610,9 @@ function EditPrinterModal({
                 </optgroup>
                 <optgroup label="X2 Series">
                   <option value="X2D">X2D</option>
+                </optgroup>
+                <optgroup label="Snapmaker">
+                  <option value="U1">Snapmaker U1</option>
                 </optgroup>
               </select>
             </div>
