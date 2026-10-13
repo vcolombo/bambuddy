@@ -1,0 +1,20 @@
+# Validation-only override for Snapmaker U1 builds: run with
+#   docker compose -f docker-compose.yml -f docker-compose.u1validate.yml up -d --build
+# alongside a live Bambuddy instance. Bridge networking (host mode and the
+# live container_name are both overridden here), a unique container/image,
+# port 8001 on the host, and separate data volumes. Add printers by IP —
+# discovery needs host-mode multicast, which this deliberately forgoes.
+services:
+  bambuddy:
+    image: bambuddy-u1val:local
+    container_name: bambuddy-u1val
+    network_mode: bridge
+    ports:
+      - "8001:8000"
+    volumes:
+      - bambuddy_u1val_data:/app/data
+      - bambuddy_u1val_logs:/app/logs
+
+volumes:
+  bambuddy_u1val_data:
+  bambuddy_u1val_logs:
