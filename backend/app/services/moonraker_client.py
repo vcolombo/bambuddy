@@ -183,7 +183,7 @@ class MoonrakerClient:
         state.current_print = filename
         state.gcode_file = filename
         state.subtask_name = filename
-        self._track_job(new_state, filename)
+        self._track_job(new_state, klippy_state, filename)
         self._first_poll = False
 
         progress = round(float(s.get("display_status", {}).get("progress") or 0.0) * 100, 1)
@@ -222,7 +222,12 @@ class MoonrakerClient:
                 return tool
         return "T0"
 
-    def _track_job(self, new_state: str, filename: str | None) -> None:
+    # Klipper terminal state -> the completion consumer's status vocabulary
+    # (main.on_print_complete reads data["status"], defaulting a missing one
+    # to "completed" — a cancelled U1 print must never ride that default).
+    TERMINAL_STATUS_MAP = {"complete": "completed", "cancelled": "cancelled", "error": "failed"}
+
+    def _track_job(self, new_state: str, klippy_state: str, filename: str | None) -> None:
         """Fire print start/complete around job identity, not raw state flips.
 
         A pause is not a new job, so PAUSE→RUNNING must not re-fire start;
@@ -234,7 +239,7 @@ class MoonrakerClient:
         if new_state == "RUNNING" and filename is not None:
             if self._active_job is None:
                 self._active_job = filename
-                data = {"filename": filename, "state": new_state}
+                data = {"filename": filename, "subtask_name": filename}
                 if self._first_poll:
                     if self.on_print_running_observed:
                         self.on_print_running_observed(data)
@@ -243,13 +248,16 @@ class MoonrakerClient:
             elif filename != self._active_job:
                 old, self._active_job = self._active_job, filename
                 if self.on_print_complete:
-                    self.on_print_complete({"filename": old, "state": new_state})
+                    # Superseded mid-print with no terminal state observed:
+                    # Bambu's else-branch vocabulary for that is "aborted".
+                    self.on_print_complete({"status": "aborted", "filename": old, "subtask_name": old})
                 if self.on_print_start:
-                    self.on_print_start({"filename": filename, "state": new_state})
+                    self.on_print_start({"filename": filename, "subtask_name": filename})
         elif new_state in ("FINISH", "FAILED") and self._active_job is not None:
             old, self._active_job = self._active_job, None
             if self.on_print_complete:
-                self.on_print_complete({"filename": old, "state": new_state})
+                status = self.TERMINAL_STATUS_MAP.get(klippy_state, "completed" if new_state == "FINISH" else "failed")
+                self.on_print_complete({"status": status, "filename": old, "subtask_name": old})
 
     def _loop(self) -> None:
         while not self._stop.wait(POLL_INTERVAL_SECONDS):

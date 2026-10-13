@@ -286,3 +286,25 @@ def test_mark_power_off_undoes_on_next_poll():
     assert client.mark_power_off() is False
     client._poll_once()
     assert client.state.connected
+
+
+@pytest.mark.parametrize(
+    ("klippy_terminal", "expected_status"),
+    [("complete", "completed"), ("cancelled", "cancelled"), ("error", "failed")],
+)
+def test_completion_payload_speaks_consumer_status_vocabulary(klippy_terminal, expected_status):
+    # main.on_print_complete reads data["status"] and defaults a missing
+    # one to "completed" — a cancelled U1 print must never ride that
+    # default into the archive/notification path as a success.
+    completed = []
+    client = FakeMoonrakerClient(
+        ip_address="192.168.4.102",
+        serial_number="U1TEST",
+        on_print_complete=lambda d: completed.append(d),
+    )
+    client._poll_once()
+    client.payloads["status"] = _status("printing", "cube.gcode")
+    client._poll_once()
+    client.payloads["status"] = _status(klippy_terminal, "cube.gcode", 1.0, 200, 200)
+    client._poll_once()
+    assert completed == [{"status": expected_status, "filename": "cube.gcode", "subtask_name": "cube.gcode"}]
