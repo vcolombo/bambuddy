@@ -4883,6 +4883,32 @@ export const api = {
     request<{ status: string }>(`/printers/${id}/refresh-status`, {
       method: 'POST',
     }),
+  // Moonraker direct print: stage user-sliced gcode on the printer and
+  // start it (Snapmaker U1). Bambu printers use the queue flow instead.
+  printFileMoonraker: async (id: number, file: File): Promise<{ started: boolean; filename: string }> => {
+    const formData = new FormData();
+    formData.append('file', file);
+    const headers: Record<string, string> = {};
+    if (authToken) {
+      headers['Authorization'] = `Bearer ${authToken}`;
+    }
+    const response = await fetch(`${API_BASE}/printers/${id}/print-file`, {
+      method: 'POST',
+      headers,
+      body: formData,
+    });
+    if (!response.ok) {
+      const error: unknown = await response.json().catch(() => ({}));
+      let message: string | undefined;
+      if (error && typeof error === 'object' && 'detail' in error) {
+        if (typeof error.detail === 'string') message = error.detail;
+        else if (error.detail && typeof error.detail === 'object' && 'message' in error.detail
+          && typeof error.detail.message === 'string') message = error.detail.message;
+      }
+      throw new Error(message || `HTTP ${response.status}`);
+    }
+    return response.json();
+  },
   connectPrinter: (id: number) =>
     request<{ connected: boolean }>(`/printers/${id}/connect`, {
       method: 'POST',

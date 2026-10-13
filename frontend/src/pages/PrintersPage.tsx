@@ -2150,6 +2150,11 @@ function PrinterCard({
   const [showResumeConfirm, setShowResumeConfirm] = useState(false);
   const [showSkipObjectsModal, setShowSkipObjectsModal] = useState(false);
   const [showUploadForPrint, setShowUploadForPrint] = useState(false);
+  const [showMoonrakerPrint, setShowMoonrakerPrint] = useState(false);
+  const [moonrakerFile, setMoonrakerFile] = useState<File | null>(null);
+  const [moonrakerBusy, setMoonrakerBusy] = useState(false);
+  const [moonrakerMsg, setMoonrakerMsg] = useState('');
+  const isMoonrakerPrinter = mapModelCode(printer.model) === 'U1';
   const [showPrinterInfo, setShowPrinterInfo] = useState(false);
   const [showDiagnostic, setShowDiagnostic] = useState(false);
   const closePrinterInfo = useCallback(() => setShowPrinterInfo(false), []);
@@ -6718,14 +6723,16 @@ function PrinterCard({
                     the two routes into this flow disagreeing. */}
                 <Button
                   size="sm"
-                  onClick={() => setShowUploadForPrint(true)}
-                  disabled={!hasPermission('library:upload') || !hasPermission('queue:create')}
+                  onClick={() => { if (isMoonrakerPrinter) { setMoonrakerFile(null); setMoonrakerMsg(''); setShowMoonrakerPrint(true); } else setShowUploadForPrint(true); }}
+                  disabled={isMoonrakerPrinter ? !hasPermission('printers:control') : (!hasPermission('library:upload') || !hasPermission('queue:create'))}
                   title={
-                    !hasPermission('library:upload')
-                      ? t('fileManager.noPermissionUpload')
-                      : !hasPermission('queue:create')
-                        ? t('fileManager.noPermissionAddToQueue')
-                        : t('common.print')
+                    isMoonrakerPrinter
+                      ? t('common.print')
+                      : !hasPermission('library:upload')
+                        ? t('fileManager.noPermissionUpload')
+                        : !hasPermission('queue:create')
+                          ? t('fileManager.noPermissionAddToQueue')
+                          : t('common.print')
                   }
                   className={`${footerActionButtonClass} !bg-bambu-green hover:!bg-bambu-green/80 !text-white`}
                 >
@@ -6795,6 +6802,52 @@ function PrinterCard({
           onSuccess={() => setPrintAfterUpload(null)}
           cleanupLibraryAfterDispatch
         />
+      )}
+
+      {/* Moonraker direct print: stage sliced gcode and start it. The Bambu
+          library/queue/AMS flow above does not apply to a Klipper machine. */}
+      {showMoonrakerPrint && (
+        <div className="fixed inset-0 bg-black/50 flex items-center justify-center z-50 p-4" onClick={() => !moonrakerBusy && setShowMoonrakerPrint(false)}>
+          <div className="bg-bambu-dark-secondary border border-bambu-dark-tertiary rounded-xl shadow-2xl max-w-md w-full p-5" onClick={e => e.stopPropagation()}>
+            <h3 className="text-white font-semibold mb-1">{t('common.print')} — {printer.name}</h3>
+            <p className="text-sm text-bambu-gray mb-4">Upload a sliced .gcode file; it is staged on the printer and started. The printer must be idle.</p>
+            <input
+              type="file"
+              accept=".gcode,.g,.gco,.ufp"
+              disabled={moonrakerBusy}
+              onChange={(e) => { setMoonrakerFile(e.target.files?.[0] ?? null); setMoonrakerMsg(''); }}
+              className="w-full text-sm text-bambu-gray mb-3"
+            />
+            {moonrakerMsg && <p className="text-sm mb-3 text-bambu-gray">{moonrakerMsg}</p>}
+            <div className="flex justify-end gap-2">
+              <Button variant="secondary" size="sm" disabled={moonrakerBusy} onClick={() => setShowMoonrakerPrint(false)}>
+                {t('common.cancel')}
+              </Button>
+              <Button
+                size="sm"
+                disabled={!moonrakerFile || moonrakerBusy}
+                className="!bg-bambu-green hover:!bg-bambu-green/80 !text-white"
+                onClick={async () => {
+                  if (!moonrakerFile) return;
+                  setMoonrakerBusy(true);
+                  setMoonrakerMsg('');
+                  try {
+                    const res = await api.printFileMoonraker(printer.id, moonrakerFile);
+                    setMoonrakerMsg(`Started ${res.filename}`);
+                    setMoonrakerFile(null);
+                    setTimeout(() => setShowMoonrakerPrint(false), 1200);
+                  } catch (err) {
+                    setMoonrakerMsg(err instanceof Error ? err.message : 'Print failed to start');
+                  } finally {
+                    setMoonrakerBusy(false);
+                  }
+                }}
+              >
+                {moonrakerBusy ? 'Starting…' : t('common.print')}
+              </Button>
+            </div>
+          </div>
+        </div>
       )}
 
       {/* MQTT Debug Modal */}
