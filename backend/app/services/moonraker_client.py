@@ -288,6 +288,43 @@ class MoonrakerClient:
         """Polling already refreshes every interval; nothing to request."""
         return False
 
+    # --- Inert Bambu-only surface (deny-by-default, never AttributeError) ---
+    # Manager/routes reach for these unconditionally; a Moonraker machine
+    # answers "no" instead of crashing the status surface.
+
+    logging_enabled = False  # MQTT log capture is a Bambu concept
+
+    @property
+    def _last_message_time(self) -> float:
+        # Routes probe this as an ack signal; the last successful poll is
+        # the Moonraker equivalent.
+        return self._last_poll_time
+
+    def enable_logging(self, enabled: bool = True) -> None:
+        pass
+
+    def get_logs(self) -> list:
+        return []
+
+    def clear_logs(self) -> None:
+        pass
+
+    def send_drying_command(
+        self, ams_id: int, temp: int, duration: int, mode: int = 1, filament: str = "", rotate_tray: bool = False
+    ) -> bool:
+        return False  # AMS drying does not exist on a toolchanger
+
+    def execute_hms_action(self, print_error: str, action: str, job_id: str | None = None) -> bool:
+        return False  # HMS is a Bambu fault domain
+
+    def mark_power_off(self) -> bool:
+        """Presume power loss (smart plug off). The next successful poll
+        undoes it if the printer is actually still there."""
+        if not self.state.connected:
+            return False
+        self.state.connected = False
+        return True
+
     # --- Dispatch (the authorized emit surface for this track) ---
 
     # Bambuddy states that refuse a new job. Mirrors the Bambu choke point:

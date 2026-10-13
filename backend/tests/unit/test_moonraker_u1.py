@@ -252,3 +252,37 @@ def test_has_ethernet_shape_for_u1_is_boolean():
     # U1 ethernet presence is unconfirmed on hardware; the predicate must at
     # least answer without raising so capability review has a value to check.
     assert isinstance(has_ethernet("U1"), bool)
+
+
+def test_bambu_only_surface_answers_no_instead_of_crashing():
+    # Manager/routes reach for these unconditionally (status route included);
+    # a Moonraker client must degrade, never AttributeError. Caught live:
+    # get_drying_targets crashed GET /printers/1/status on first deploy.
+    from backend.app.services.printer_manager import PrinterManager
+
+    manager = PrinterManager()
+    client = FakeMoonrakerClient(ip_address="192.168.4.102", serial_number="U1TEST")
+    client._poll_once()
+    manager._clients[3] = client
+    manager._models[3] = "U1"
+    try:
+        assert manager.get_drying_targets(3) is None
+        assert manager.get_logs(3) == []
+        assert manager.is_logging_enabled(3) is False
+        assert manager.send_drying_command(3, 0, 45, 60) is False
+        assert client.execute_hms_action("0300", "resume") is False
+        assert client._last_message_time > 0
+    finally:
+        del manager._clients[3]
+        del manager._models[3]
+
+
+def test_mark_power_off_undoes_on_next_poll():
+    client = FakeMoonrakerClient(ip_address="192.168.4.102", serial_number="U1TEST")
+    client._poll_once()
+    assert client.state.connected
+    assert client.mark_power_off() is True
+    assert not client.state.connected
+    assert client.mark_power_off() is False
+    client._poll_once()
+    assert client.state.connected

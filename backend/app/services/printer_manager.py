@@ -901,7 +901,8 @@ class PrinterManager:
         ``BambuMQTTClient``).
         """
         client = self._clients.get(printer_id)
-        return client._drying_targets if client else None
+        # AMS drying is Bambu-only; Moonraker clients carry no such cache.
+        return getattr(client, "_drying_targets", None) if client else None
 
     def get_all_statuses(self) -> dict[int, PrinterState]:
         """Get status of all connected printers (checks for stale connections)."""
@@ -920,7 +921,7 @@ class PrinterManager:
             return client.check_staleness()
         return False
 
-    def get_client(self, printer_id: int) -> BambuMQTTClient | None:
+    def get_client(self, printer_id: int) -> BambuMQTTClient | MoonrakerClient | None:
         """Get the MQTT client for a printer."""
         return self._clients.get(printer_id)
 
