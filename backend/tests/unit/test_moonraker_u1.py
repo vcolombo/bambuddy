@@ -308,3 +308,55 @@ def test_completion_payload_speaks_consumer_status_vocabulary(klippy_terminal, e
     client.payloads["status"] = _status(klippy_terminal, "cube.gcode", 1.0, 200, 200)
     client._poll_once()
     assert completed == [{"status": expected_status, "filename": "cube.gcode", "subtask_name": "cube.gcode"}]
+
+
+@pytest.mark.asyncio
+async def test_u1_completion_never_attempts_sd_card_delete():
+    """Emit-side deny (domain model): print completion must not fire Bambu
+    FTP deletes at a Moonraker printer. Caught live on first validation
+    print: SD cleanup burned 3 retries x2 candidates against the U1."""
+    from types import SimpleNamespace
+    from unittest.mock import AsyncMock, MagicMock, patch
+
+    printer = SimpleNamespace(model="U1", name="Snapmaker U1", ip_address="192.168.4.102", access_code="")
+
+    async def fake_execute(stmt, *args, **kwargs):
+        result = MagicMock()
+        is_printer_lookup = "from printers" in str(stmt).lower()
+        result.scalar_one_or_none = MagicMock(return_value=printer if is_printer_lookup else None)
+        result.scalars = MagicMock(
+            return_value=MagicMock(all=MagicMock(return_value=[]), first=MagicMock(return_value=None))
+        )
+        result.scalar = MagicMock(return_value=None)
+        return result
+
+    with (
+        patch("backend.app.main.async_session") as mock_session_maker,
+        patch("backend.app.main.ws_manager") as mock_ws,
+        patch("backend.app.main.printer_manager") as mock_pm,
+        patch("backend.app.main.mqtt_relay") as mock_relay,
+        patch("backend.app.main.spawn_background_task"),
+        patch("backend.app.main.clear_3mf_cache"),
+        patch("backend.app.services.bambu_ftp.delete_file_async", new=AsyncMock()) as mock_delete,
+    ):
+        mock_ws.send_print_complete = AsyncMock()
+        mock_relay.on_print_complete = AsyncMock()
+        mock_pm.get_printer = MagicMock(return_value=MagicMock(name="Snapmaker U1", serial_number="U1TEST"))
+        mock_pm.get_current_print_user = MagicMock(return_value=None)
+        mock_pm.clear_current_print_user = MagicMock()
+        mock_pm.set_awaiting_plate_clear = MagicMock()
+
+        mock_session = AsyncMock()
+        mock_session.__aenter__ = AsyncMock(return_value=mock_session)
+        mock_session.__aexit__ = AsyncMock()
+        mock_session.execute = AsyncMock(side_effect=fake_execute)
+        mock_session_maker.return_value = mock_session
+
+        from backend.app.main import on_print_complete
+
+        await on_print_complete(
+            1,
+            {"filename": "cube.gcode", "subtask_name": "cube.gcode", "status": "completed"},
+        )
+
+        mock_delete.assert_not_called()

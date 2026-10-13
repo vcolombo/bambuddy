@@ -7178,7 +7178,14 @@ async def on_print_complete(printer_id: int, data: dict):
                     archive_row = await db.execute(select(PrintArchive.filename).where(PrintArchive.id == archive_id))
                     archive_filename = archive_row.scalar_one_or_none()
 
-            if printer:
+            # Emit-side deny for Moonraker (domain model): the file lives in
+            # Klipper storage, not on a Bambu SD card, and no Bambu FTP
+            # delete may be attempted against it.
+            from backend.app.utils.printer_models import uses_moonraker_transport
+
+            if printer and uses_moonraker_transport(printer.model):
+                logger.debug("SD card cleanup skipped for Moonraker printer %s", printer.name)
+            elif printer:
                 from backend.app.services.bambu_ftp import DeleteResult, delete_file_async
                 from backend.app.utils.filename import derive_remote_filename
 
