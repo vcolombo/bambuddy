@@ -5,7 +5,7 @@ import secrets
 import zipfile
 from pathlib import Path
 
-from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, UploadFile
 from fastapi.responses import FileResponse, Response
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -60,6 +60,7 @@ from backend.app.services.bambu_ftp import (
     get_storage_info_async,
     list_files_result_async,
 )
+from backend.app.services.moonraker_client import MoonrakerClient
 from backend.app.services.print_storage import ftp_probe_paths, print_file_reachable_over_ftp
 from backend.app.services.printer_diagnostic import run_connection_diagnostic
 from backend.app.services.printer_manager import (
@@ -96,7 +97,7 @@ from backend.app.utils.filament_types import is_material_name, printer_filament_
 from backend.app.utils.fts_routing import slot_extruder
 from backend.app.utils.http import build_content_disposition, download_error_response, safe_download_filename
 from backend.app.utils.kprofile_lookup import build_slot_k_resolver
-from backend.app.utils.printer_models import MAX_CHAMBER_TEMP_C, uses_exhaust_fan_label
+from backend.app.utils.printer_models import MAX_CHAMBER_TEMP_C, uses_exhaust_fan_label, uses_moonraker_transport
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/printers", tags=["printers"])
@@ -171,11 +172,20 @@ async def create_printer(
     result = await db.execute(select(Printer).where(Printer.serial_number == printer_data.serial_number))
     if result.scalar_one_or_none():
         raise HTTPException(400, "Printer with this serial number already exists")
+    if not uses_moonraker_transport(printer_data.model) and not printer_data.access_code:
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "code": "printer_connection_failed",
+                "message": "An access code is required for Bambu printers. The printer was not added.",
+            },
+        )
 
     test_result = await printer_manager.test_connection(
         ip_address=printer_data.ip_address,
         serial_number=printer_data.serial_number,
         access_code=printer_data.access_code,
+        model=printer_data.model,
     )
     if not test_result.get("success"):
         # The frontend renders the user-facing message via i18n on `code`;
@@ -1003,11 +1013,76 @@ async def disconnect_printer(
     return {"connected": False}
 
 
+@router.post("/{printer_id}/print-file")
+async def start_print_file(
+    printer_id: int,
+    file: UploadFile | None = File(None),
+    server_path: str | None = Form(None),
+    plate: int | None = Form(None),
+    _=RequirePermissionIfAuthEnabled(Permission.PRINTERS_CONTROL),
+    db: AsyncSession = Depends(get_db),
+):
+    """Upload-then-start a user-sliced file on a Moonraker printer.
+
+    Two shapes, exactly one required: gcode bytes as ``file`` (staged then
+    started by name), or ``server_path`` + explicit ``plate`` for a 3MF
+    already on the printer (converted on-device; cloud-print is never
+    called). Bambu printers are refused — their queue path is unchanged.
+    """
+    result = await db.execute(select(Printer).where(Printer.id == printer_id))
+    printer = result.scalar_one_or_none()
+    if not printer:
+        raise HTTPException(404, "Printer not found")
+    if not uses_moonraker_transport(printer.model):
+        raise HTTPException(400, {"code": "not_moonraker", "message": "Direct file print is Moonraker printers only."})
+    status = printer_manager.get_status(printer_id)
+    if status is not None and status.state in MoonrakerClient.BUSY_STATES:
+        raise HTTPException(400, {"code": "printer_busy", "message": "The printer is busy; nothing was staged."})
+    if (file is None) == (not server_path):
+        raise HTTPException(
+            400, {"code": "file_or_path_required", "message": "Send exactly one of file bytes or server_path."}
+        )
+
+    if server_path is not None:
+        if not server_path.lower().endswith(".3mf"):
+            raise HTTPException(400, {"code": "not_a_3mf", "message": "server_path must point at a 3MF."})
+        if plate is None:
+            raise HTTPException(
+                400, {"code": "plate_required", "message": "Choose the plate to print; none is assumed."}
+            )
+        # The Moonraker transport is synchronous urllib (up to 120s per
+        # upload): never call it inline or the whole API loop stalls behind
+        # one dispatch — same class as the #1445 teardown hang, so the same
+        # cure (threads, not bigger timeouts).
+        if not await asyncio.to_thread(printer_manager.start_plate, printer_id, server_path, plate):
+            raise HTTPException(400, _start_failure(printer_id, server_path))
+        return {"started": True, "path": server_path, "plate": plate}
+
+    data = await file.read()
+    if len(data) > 200 * 1024 * 1024:
+        raise HTTPException(413, "File exceeds the 200 MiB direct-print limit.")
+    name = Path(file.filename or "upload.gcode").name
+    if not await asyncio.to_thread(printer_manager.upload_print_file, printer_id, data, name):
+        raise HTTPException(400, {"code": "upload_failed", "message": f"Could not stage {name} on the printer."})
+    if not await asyncio.to_thread(printer_manager.start_print, printer_id, name):
+        raise HTTPException(400, _start_failure(printer_id, name))
+    return {"started": True, "filename": name}
+
+
+def _start_failure(printer_id: int, what: str) -> dict:
+    """Refusal code for a failed Moonraker start: busy vs anything else."""
+    status = printer_manager.get_status(printer_id)
+    if status is not None and status.state in MoonrakerClient.BUSY_STATES:
+        return {"code": "printer_busy", "message": f"The printer is busy; {what} was not started."}
+    return {"code": "start_failed", "message": f"{what} was not started."}
+
+
 @router.post("/test")
 async def test_printer_connection(
     ip_address: str,
     serial_number: str,
-    access_code: str,
+    access_code: str = "",
+    model: str | None = None,
     _=RequirePermissionIfAuthEnabled(Permission.PRINTERS_CREATE),
 ):
     """Test connection to a printer without saving."""
@@ -1015,6 +1090,7 @@ async def test_printer_connection(
         ip_address=ip_address,
         serial_number=serial_number,
         access_code=access_code,
+        model=model,
     )
     return result
 

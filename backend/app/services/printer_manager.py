@@ -15,8 +15,10 @@ from backend.app.services.bambu_mqtt import (
     PrinterState,
     get_stage_name,
 )
+from backend.app.services.moonraker_client import MoonrakerClient
 from backend.app.utils.ams_humidity import ams_humidity_percent
 from backend.app.utils.kprofile_lookup import build_slot_k_resolver
+from backend.app.utils.printer_models import uses_moonraker_transport
 
 logger = logging.getLogger(__name__)
 
@@ -385,7 +387,7 @@ class PrinterManager:
     """Manager for multiple printer connections."""
 
     def __init__(self):
-        self._clients: dict[int, BambuMQTTClient] = {}
+        self._clients: dict[int, BambuMQTTClient | MoonrakerClient] = {}
         self._models: dict[int, str | None] = {}  # Cache printer models for feature detection
         self._printer_info: dict[int, PrinterInfo] = {}  # Cache printer name/serial for callbacks
         # Last AMS / external-spool reading of a printer whose client has been
@@ -798,25 +800,42 @@ class PrinterManager:
             if self._on_tray_change:
                 self._schedule_async(self._on_tray_change(printer_id, tray_global, layer_num))
 
-        client = BambuMQTTClient(
-            ip_address=printer.ip_address,
-            serial_number=printer.serial_number,
-            access_code=printer.access_code,
-            model=printer.model,
-            on_state_change=on_state_change,
-            on_print_start=on_print_start,
-            on_print_complete=on_print_complete,
-            on_ams_change=on_ams_change,
-            on_fts_inlet_change=on_fts_inlet_change,
-            on_layer_change=on_layer_change,
-            on_print_progress=on_print_progress,
-            on_bed_temp_update=on_bed_temp_update,
-            on_drying_complete=on_drying_complete,
-            on_print_running_observed=on_print_running_observed,
-            on_finish_photo_moment=on_finish_photo_moment,
-            on_assignment_verified=on_assignment_verified,
-            on_tray_change=on_tray_change,
-        )
+        if uses_moonraker_transport(printer.model):
+            # Moonraker (Klipper) machines share the read-path surface only:
+            # state polling plus print/progress/layer events. Everything
+            # emit-side stays unwired per the deny-on-emit rule.
+            client: BambuMQTTClient | MoonrakerClient = MoonrakerClient(
+                ip_address=printer.ip_address,
+                serial_number=printer.serial_number,
+                access_code=printer.access_code or "",
+                model=printer.model,
+                on_state_change=on_state_change,
+                on_print_start=on_print_start,
+                on_print_complete=on_print_complete,
+                on_print_progress=on_print_progress,
+                on_layer_change=on_layer_change,
+                on_print_running_observed=on_print_running_observed,
+            )
+        else:
+            client = BambuMQTTClient(
+                ip_address=printer.ip_address,
+                serial_number=printer.serial_number,
+                access_code=printer.access_code,
+                model=printer.model,
+                on_state_change=on_state_change,
+                on_print_start=on_print_start,
+                on_print_complete=on_print_complete,
+                on_ams_change=on_ams_change,
+                on_fts_inlet_change=on_fts_inlet_change,
+                on_layer_change=on_layer_change,
+                on_print_progress=on_print_progress,
+                on_bed_temp_update=on_bed_temp_update,
+                on_drying_complete=on_drying_complete,
+                on_print_running_observed=on_print_running_observed,
+                on_finish_photo_moment=on_finish_photo_moment,
+                on_assignment_verified=on_assignment_verified,
+                on_tray_change=on_tray_change,
+            )
 
         client.connect()
         self._clients[printer_id] = client
@@ -965,6 +984,12 @@ class PrinterManager:
             caller.name,
         )
         if printer_id in self._clients:
+            if uses_moonraker_transport(self._models.get(printer_id)):
+                # Moonraker dispatch is file-first: the scheduler uploads via
+                # upload_print_file, then starts by name. Bambu-only knobs
+                # (AMS mapping, calibrations) have no meaning here — the
+                # guards live in the client choke point, as on Bambu.
+                return self._clients[printer_id].start_print(filename, plate_id)
             return self._clients[printer_id].start_print(
                 filename,
                 plate_id,
@@ -979,6 +1004,23 @@ class PrinterManager:
                 nozzle_mapping=nozzle_mapping,
                 nozzle_slot_extruders=nozzle_slot_extruders,
             )
+        return False
+
+    def upload_print_file(self, printer_id: int, data: bytes, filename: str) -> bool:
+        """Stage a sliced file on a Moonraker printer. Bambu machines take
+        files over FTPS elsewhere, so anything else here is refused."""
+        if printer_id in self._clients and uses_moonraker_transport(self._models.get(printer_id)):
+            return self._clients[printer_id].upload_gcode(data, filename)
+        logger.warning("upload_print_file refused: printer %s is not a Moonraker machine", printer_id)
+        return False
+
+    def start_plate(self, printer_id: int, server_path: str, plate: int) -> bool:
+        """Start one explicitly-chosen plate of a 3MF already on a Moonraker
+        printer. The plate is required — never defaulted. Anything else here
+        is refused."""
+        if printer_id in self._clients and uses_moonraker_transport(self._models.get(printer_id)):
+            return self._clients[printer_id].start_plate_3mf(server_path, plate)
+        logger.warning("start_plate refused: printer %s is not a Moonraker machine", printer_id)
         return False
 
     def stop_print(self, printer_id: int) -> bool:
@@ -1096,6 +1138,7 @@ class PrinterManager:
         ip_address: str,
         serial_number: str,
         access_code: str,
+        model: str | None = None,
     ) -> dict:
         """Test connection to a printer without persisting.
 
@@ -1107,11 +1150,19 @@ class PrinterManager:
         original synchronous teardown produced the #1445 "Docker container
         hangs" symptom on P1S when called from POST /printers/.
         """
-        client = BambuMQTTClient(
-            ip_address=ip_address,
-            serial_number=serial_number,
-            access_code=access_code,
-        )
+        if uses_moonraker_transport(model):
+            client: BambuMQTTClient | MoonrakerClient = MoonrakerClient(
+                ip_address=ip_address,
+                serial_number=serial_number,
+                access_code=access_code or "",
+                model=model,
+            )
+        else:
+            client = BambuMQTTClient(
+                ip_address=ip_address,
+                serial_number=serial_number,
+                access_code=access_code,
+            )
 
         try:
             client.connect()

@@ -45,7 +45,9 @@ class PrinterCreate(PrinterBase):
     # access_code lives on the input shapes only — never on the default
     # PrinterResponse. Direct exposure on PRINTERS_READ would let a Viewer
     # connect to the printer's MQTT and bypass Bambuddy's RBAC.
-    access_code: str = Field(..., min_length=1, max_length=20)
+    # Optional because codeless LAN transports (Moonraker) have no access
+    # code; create_printer still rejects an empty one for Bambu models.
+    access_code: str = Field(default="", max_length=20)
 
 
 class PlateDetectionROI(BaseModel):

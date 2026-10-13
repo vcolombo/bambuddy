@@ -24,6 +24,9 @@ PRINTER_MODEL_MAP = {
     "Bambu Lab H2S": "H2S",
     "Bambu Lab X2D": "X2D",
     "Bambu Lab A2L": "A2L",
+    # Snapmaker U1 (Moonraker, not Bambu MQTT — see the Moonraker transports
+    # below). mDNS TXT machine_type carries "Snapmaker U1".
+    "Snapmaker U1": "U1",
 }
 
 # Map from printer_model_id (internal codes in slice_info.config) to short names
@@ -299,6 +302,33 @@ def uses_exhaust_fan_label(model: str | None) -> bool:
         return False
     normalized = model.strip().upper().replace(" ", "").replace("-", "")
     return normalized in EXHAUST_FAN_LABEL_MODELS
+
+
+# Non-Bambu transports. The Snapmaker U1 speaks Moonraker (Klipper), not
+# Bambu MQTT. Transport selection keys off these sets so Printer needs no
+# kind column while a single non-Bambu family exists. Default-deny holds:
+# a model gets Bambu behaviors only by explicit membership in the sets
+# above, which the U1 never gets.
+MOONRAKER_MODELS = frozenset({"U1"})
+
+
+def uses_moonraker_transport(model: str | None) -> bool:
+    """Return True if the printer model speaks Moonraker instead of Bambu MQTT."""
+    if not model:
+        return False
+    return model.strip().upper().replace(" ", "").replace("-", "") in MOONRAKER_MODELS
+
+
+# Toolchanger printers (toolheads T0–T3) as opposed to AMS-slot machines.
+# Filament state hangs off tools, not trays.
+TOOLCHANGER_MODELS = frozenset({"U1"})
+
+
+def is_toolchanger_model(model: str | None) -> bool:
+    """Return True if the printer maps filament to toolheads, not AMS slots."""
+    if not model:
+        return False
+    return model.strip().upper().replace(" ", "").replace("-", "") in TOOLCHANGER_MODELS
 
 
 # Ceiling for every chamber-temperature target the UI and API accept (manual
