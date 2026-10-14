@@ -1,2 +1,4 @@
 .env
 data/
+# Downloaded 134 MB upstream nightly used only as Docker build context.
+*.AppImage

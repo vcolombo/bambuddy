@@ -1,0 +1,31 @@
+# Snapmaker U1 slicer sidecar using a fixed 2.4.1 nightly AppImage.
+#
+# Why nightly: stable Snapmaker Orca 2.4.0 segfaults in CLI mode for every
+# project .3mf input (Snapmaker/OrcaSlicer#935). main@4996d50 includes the
+# null-`wxTheApp` guard in expand_plate_extruders(), but 2.4.1 has not been
+# released yet. GitHub Actions artifacts require authentication and expire,
+# so place this exact file in the build context before building:
+#
+#   Snapmaker_Orca_Linux_AppImage_Ubuntu2404_V2.4.1.AppImage
+#
+# Provenance used for the first deployment:
+#   workflow run: 38611753448
+#   artifact ID:  11921885524
+#   commit:       4996d50a882159653c9ddbacef5ceb3601e5d54b
+#
+# Build:
+#   docker build -f slicer-api/Dockerfile.u1-nightly \
+#     -t bambuddy-u1-slicer-api:2.4.1-nightly-4996d50 slicer-api/
+#
+# When a stable >=2.4.1 AppImage is published, retire this file and update
+# the pinned release URL in Dockerfile.u1 instead.
+
+FROM ubuntu:24.04 AS extract
+COPY Snapmaker_Orca_Linux_AppImage_Ubuntu2404_V2.4.1.AppImage /tmp/snapmaker-orca.AppImage
+RUN chmod +x /tmp/snapmaker-orca.AppImage \
+    && cd / && /tmp/snapmaker-orca.AppImage --appimage-extract
+
+FROM maziggy/orca-slicer-api:latest
+COPY --from=extract /squashfs-root /opt/snapmaker-orca
+ENV ORCASLICER_PATH=/opt/snapmaker-orca/AppRun \
+    BUNDLED_PROFILES_PATH=/opt/snapmaker-orca/resources/profiles/Snapmaker

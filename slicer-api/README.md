@@ -205,6 +205,15 @@ the pinned revision is the preset source of truth, the same extraction
 that was test-sliced against `Snapmaker U1 (0.4 nozzle)` /
 `0.20mm High Quality` / `Snapmaker PLA Basic @U1`.
 
+**Project-3MF caveat:** the v2.4.0 CLI segfaults for *every* project
+`.3mf` input (upstream issue
+[Snapmaker/OrcaSlicer#935](https://github.com/Snapmaker/OrcaSlicer/issues/935));
+plain STL inputs slice normally. `main` has the null-app guard fix, so
+until a stable 2.4.1+ exists, use `Dockerfile.u1-nightly` with the
+matching Linux V2.4.1 Actions artifact in this directory (see that file
+for the pinned run, artifact and commit) when project-3MF slicing is
+required.
+
 One Snapmaker-fork quirk to know: its leaf presets ship
 `wipe_tower_filament` as the string `"0"`, which its own CLI segfaults
 on when the key arrives in a flat settings file. Bambuddy strips that

@@ -18,8 +18,8 @@ services:
   snapmaker-u1-slicer-api:
     build:
       context: .
-      dockerfile: Dockerfile.u1
-    image: bambuddy-u1-slicer-api:local
+      dockerfile: ${U1_SLICER_DOCKERFILE:-Dockerfile.u1}
+    image: ${U1_SLICER_IMAGE:-bambuddy-u1-slicer-api:local}
     container_name: bambuddy-u1-slicer
     restart: unless-stopped
     ports:
