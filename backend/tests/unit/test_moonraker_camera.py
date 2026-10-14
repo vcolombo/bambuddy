@@ -13,6 +13,10 @@ from backend.tests.unit.test_moonraker_u1 import FakeMoonrakerClient
 JPEG = b"\xff\xd8" + b"frame-bytes" + b"\xff\xd9"
 
 
+class IncompleteReadStandIn(Exception):
+    """http.client.IncompleteRead is an Exception subclass; any one will do."""
+
+
 class CameraFake(FakeMoonrakerClient):
     """FakeMoonrakerClient with a scripted monitor.jpg on the printer.
 
@@ -26,8 +30,10 @@ class CameraFake(FakeMoonrakerClient):
         self.START_ADVANCE_TIMEOUT = 0.05
         self.ADVANCE_POLL_SECONDS = 0.005
         self.MONITOR_COOLDOWN_SECONDS = 0.0
+        self.FETCH_RETRY_SECONDS = 0.005
         self._mtimes = list(mtimes)
-        self._frame = frame
+        # One outcome per read (last repeats): bytes, or an Exception to raise.
+        self._frames = list(frame) if isinstance(frame, list) else [frame]
         self._start_result = start_result if start_result is not None else {"state": "success"}
         # A real start_monitor makes the firmware write a new frame; model
         # that only when asked, so a "success that never produces a frame"
@@ -42,7 +48,10 @@ class CameraFake(FakeMoonrakerClient):
         return super()._get(path, params)
 
     def _get_bytes(self, path):
-        return self._frame
+        outcome = self._frames.pop(0) if len(self._frames) > 1 else self._frames[0]
+        if isinstance(outcome, Exception):
+            raise outcome
+        return outcome
 
     def _ws_call(self, method, params):
         assert method == "camera.start_monitor"
@@ -110,3 +119,19 @@ def test_due_renewal_restarts_even_while_the_monitor_advances():
     client._monitor_started_at = time.time() - (client.MONITOR_RENEW_SECONDS + 1)
     assert client.capture_snapshot() == JPEG
     assert client.start_calls == 1
+
+
+def test_read_landing_mid_rewrite_is_retried_not_dropped():
+    # Seen live on the first deployed stream run: monitor.jpg is rewritten
+    # ~1/s, so a read can come back short. The next read is complete.
+    torn = IncompleteReadStandIn("147602 bytes read, 495 more expected")
+    client = _client(mtimes=[100.0, 101.0], frame=[torn, JPEG[:6], JPEG])
+    client._monitor_started_at = time.time()
+    assert client.capture_snapshot() == JPEG
+
+
+def test_reads_that_never_arrive_complete_give_up_as_none():
+    torn = IncompleteReadStandIn("always torn")
+    client = _client(mtimes=[100.0, 101.0], frame=torn)
+    client._monitor_started_at = time.time()
+    assert client.capture_snapshot() is None

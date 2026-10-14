@@ -228,6 +228,31 @@ class MoonrakerClient:
         self._monitor_started_at = now
         return True
 
+    FETCH_ATTEMPTS = 3
+    FETCH_RETRY_SECONDS = 0.15
+
+    def _fetch_complete_frame(self) -> bytes | None:
+        """Fetch monitor.jpg, retrying a read that lands mid-rewrite.
+
+        The firmware rewrites the file ~1/s, so a read can come back short
+        (IncompleteRead) or truncated — seen live on the first deployed
+        stream run. The next write is complete, so a quick retry succeeds,
+        and it can only return a frame at least as new as the advance
+        already proven. Anything that never arrives complete is None, never
+        a torn image.
+        """
+        for attempt in range(self.FETCH_ATTEMPTS):
+            try:
+                frame = self._get_bytes("/server/files/camera/monitor.jpg")
+            except Exception as e:
+                logger.debug(f"[{self.serial_number}] camera frame read failed (attempt {attempt + 1}): {e}")
+            else:
+                if self._is_complete_jpeg(frame):
+                    return frame
+            if attempt + 1 < self.FETCH_ATTEMPTS:
+                time.sleep(self.FETCH_RETRY_SECONDS)
+        return None
+
     def capture_snapshot(self) -> bytes | None:
         """Capture one fresh JPEG still via the repeater monitor, or None.
 
@@ -253,9 +278,9 @@ class MoonrakerClient:
             if advanced is None:
                 logger.warning(f"[{self.serial_number}] camera monitor produced no new frame; not serving stale image")
                 return None
-            frame = self._get_bytes("/server/files/camera/monitor.jpg")
-            if not self._is_complete_jpeg(frame):
-                logger.warning(f"[{self.serial_number}] camera frame is not a complete JPEG; discarding")
+            frame = self._fetch_complete_frame()
+            if frame is None:
+                logger.warning(f"[{self.serial_number}] camera frame never arrived complete; discarding")
                 return None
             return frame
         except Exception as e:
