@@ -492,3 +492,22 @@ async def test_automatic_plate_check_emits_nothing_for_u1():
 
     check_plate_empty.assert_not_called()
     assert events == []
+
+
+@pytest.mark.parametrize(
+    ("declared", "expected"),
+    [("Bambu Lab X1 Carbon", "X1C"), ("Snapmaker U1", "U1")],
+)
+def test_plain_gcode_trailer_model_reaches_sliced_for(tmp_path, declared, expected):
+    """Bare .gcode (no zip container) must still yield sliced_for_model:
+    Orca-family slicers put printer_model in the trailing CONFIG_BLOCK,
+    past the head window. Without this the exact-match dispatch guard
+    sees None and fail-opens on a declared Bambu slice.
+    """
+    from backend.app.services.archive import ThreeMFParser
+
+    filler = b"G1 X1 Y1\n" * 20000  # push the trailer past the 64KB head window
+    path = tmp_path / "job.gcode"
+    path.write_bytes(b"; generated\n" + filler + f"; printer_model = {declared}\n".encode())
+
+    assert ThreeMFParser(path).parse().get("sliced_for_model") == expected

@@ -216,6 +216,30 @@ class ThreeMFParser:
 
     def parse(self) -> dict:
         """Extract metadata from 3MF file."""
+        if not zipfile.is_zipfile(self.file_path):
+            # Bare .gcode (Snapmaker Orca and other non-Bambu slicers):
+            # there is no zip container, so scan the text directly. Head
+            # AND tail: Bambu writes its CONFIG_BLOCK just after the
+            # header, Orca-family slicers append it at end of file, and
+            # printer_model lives in that block. Without this, sliced_for
+            # metadata is silently empty and every downstream compat
+            # check fail-opens on a missing declaration.
+            try:
+                with open(self.file_path, "rb") as f:
+                    head = f.read(_GCODE_SCAN_BYTES)
+                    f.seek(0, 2)
+                    size = f.tell()
+                    tail = b""
+                    if size > _GCODE_SCAN_BYTES:
+                        f.seek(size - _GCODE_SCAN_BYTES)
+                        tail = f.read()
+                text = head.decode("utf-8", errors="ignore")
+                if tail:
+                    text += "\n" + tail.decode("utf-8", errors="ignore")
+                self._parse_gcode_header_text(text)
+            except Exception as e:
+                logger.warning("ThreeMFParser: failed to parse plain gcode %s: %s", self.file_path, e)
+            return self.metadata
         try:
             with zipfile.ZipFile(self.file_path, "r") as zf:
                 self._parse_slice_info(zf)  # Now sets self.plate_number from slice_info
@@ -436,13 +460,7 @@ class ThreeMFParser:
         return min(gcode_files, key=lambda name: (plate_index(name), gcode_files.index(name)))
 
     def _parse_gcode_header(self, zf: zipfile.ZipFile):
-        """Parse the printed plate's G-code for what only it can settle.
-
-        The plate's own G-code is the file the printer executes, so where it
-        disagrees with ``project_settings.config`` — the *project's* record,
-        which a multi-plate or per-plate-modified export can leave describing
-        a different plate entirely — the G-code wins.
-        """
+        """Read the printed plate's G-code header out of the 3MF zip."""
         try:
             gcode_files = [f for f in zf.namelist() if f.endswith(".gcode")]
             if not gcode_files:
@@ -456,49 +474,58 @@ class ThreeMFParser:
             # of the wider window is a few tens of KB per archived file.
             with zf.open(gcode_path) as f:
                 header = f.read(_GCODE_SCAN_BYTES).decode("utf-8", errors="ignore")
-
-            # Look for "; total layer number: XX" pattern
-            match = re.search(r";\s*total\s+layer\s+number[:\s]+(\d+)", header, re.IGNORECASE)
-            if match:
-                self.metadata["total_layers"] = int(match.group(1))
-
-            # Layer height, overriding project_settings.config when both are
-            # present. The project config records the project's settings and can
-            # describe a plate other than this one; the plate's G-code is what
-            # the printer executes, so it decides. Anchored to the line start so keys ending in
-            # "layer_height" (independent_support_layer_height) can't match.
-            match = re.search(r"^;\s*layer_height\s*=\s*([\d.]+)\s*$", header, re.IGNORECASE | re.MULTILINE)
-            if match:
-                try:
-                    self.metadata["layer_height"] = float(match.group(1))
-                except ValueError:
-                    pass  # Malformed value: keep whatever project_settings gave us
-
-            # Total filament usage. The slicer writes the print's totals into
-            # the G-code header ("; total filament weight [g] : 126.26"). Only
-            # a fallback — slice_info.config is more authoritative when present
-            # — but it covers sliced outputs whose slice_info lacks per-filament
-            # used_g, and it's the slicer's own figure regardless.
-            if "filament_used_grams" not in self.metadata:
-                match = re.search(r";\s*total\s+filament\s+weight\s*\[g\]\s*:\s*([\d.]+)", header, re.IGNORECASE)
-                if match:
-                    self.metadata["filament_used_grams"] = float(match.group(1))
-            if "filament_used_mm" not in self.metadata:
-                match = re.search(r";\s*total\s+filament\s+length\s*\[mm\]\s*:\s*([\d.]+)", header, re.IGNORECASE)
-                if match:
-                    self.metadata["filament_used_mm"] = float(match.group(1))
-
-            # Look for printer_model in gcode header (fallback if not found in slice_info)
-            # Format: "; printer_model = Bambu Lab X1 Carbon" or "; printer_model = X1C"
-            if "sliced_for_model" not in self.metadata:
-                match = re.search(r";\s*printer_model\s*=\s*(.+)", header, re.IGNORECASE)
-                if match:
-                    from backend.app.utils.printer_models import normalize_printer_model
-
-                    raw_model = match.group(1).strip()
-                    self.metadata["sliced_for_model"] = normalize_printer_model(raw_model)
+            self._parse_gcode_header_text(header)
         except Exception:
             pass  # G-code header parsing is best-effort; metadata may come from other sources
+
+    def _parse_gcode_header_text(self, header: str):
+        """Extract what only the executed G-code can settle, from its text.
+
+        The plate's own G-code is the file the printer executes, so where it
+        disagrees with ``project_settings.config`` — the *project's* record,
+        which a multi-plate or per-plate-modified export can leave describing
+        a different plate entirely — the G-code wins.
+        """
+        # Look for "; total layer number: XX" pattern
+        match = re.search(r";\s*total\s+layer\s+number[:\s]+(\d+)", header, re.IGNORECASE)
+        if match:
+            self.metadata["total_layers"] = int(match.group(1))
+
+        # Layer height, overriding project_settings.config when both are
+        # present. The project config records the project's settings and can
+        # describe a plate other than this one; the plate's G-code is what
+        # the printer executes, so it decides. Anchored to the line start so keys ending in
+        # "layer_height" (independent_support_layer_height) can't match.
+        match = re.search(r"^;\s*layer_height\s*=\s*([\d.]+)\s*$", header, re.IGNORECASE | re.MULTILINE)
+        if match:
+            try:
+                self.metadata["layer_height"] = float(match.group(1))
+            except ValueError:
+                pass  # Malformed value: keep whatever project_settings gave us
+
+        # Total filament usage. The slicer writes the print's totals into
+        # the G-code header ("; total filament weight [g] : 126.26"). Only
+        # a fallback — slice_info.config is more authoritative when present
+        # — but it covers sliced outputs whose slice_info lacks per-filament
+        # used_g, and it's the slicer's own figure regardless.
+        if "filament_used_grams" not in self.metadata:
+            match = re.search(r";\s*total\s+filament\s+weight\s*\[g\]\s*:\s*([\d.]+)", header, re.IGNORECASE)
+            if match:
+                self.metadata["filament_used_grams"] = float(match.group(1))
+        if "filament_used_mm" not in self.metadata:
+            match = re.search(r";\s*total\s+filament\s+length\s*\[mm\]\s*:\s*([\d.]+)", header, re.IGNORECASE)
+            if match:
+                self.metadata["filament_used_mm"] = float(match.group(1))
+
+        # Look for printer_model in gcode header (fallback if not found in slice_info)
+        # Format: "; printer_model = Bambu Lab X1 Carbon" or "; printer_model = X1C"
+        if "sliced_for_model" not in self.metadata:
+            match = re.search(r";\s*printer_model\s*=\s*(.+)", header, re.IGNORECASE)
+            if match:
+                from backend.app.utils.printer_models import normalize_printer_model
+
+                raw_model = match.group(1).strip()
+                self.metadata["sliced_for_model"] = normalize_printer_model(raw_model)
 
     def _extract_filament_info(self, data: dict):
         """Extract filament info from project settings — includes support
