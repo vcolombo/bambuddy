@@ -81,6 +81,8 @@ class MoonrakerClient:
         self._first_poll = True
         self._monitor_started_at = 0.0
         self._monitor_attempt_at = 0.0
+        self._gcode_in_flight = False
+        self._gcode_lock = threading.Lock()
         self._prev_progress: int | None = None
         self._prev_layer: int | None = None
 
@@ -287,22 +289,35 @@ class MoonrakerClient:
             logger.warning(f"[{self.serial_number}] camera snapshot failed: {e}")
             return None
 
+    # Motion dispatch is single-flight: homing and moves execute
+    # synchronously inside Klipper's script processing, so the POST can
+    # take as long as the motion itself. One in-flight motion at a time,
+    # on its own thread — a second click is refused rather than queued,
+    # so no stale jog can execute minutes later behind a failed or
+    # disconnected home. There is deliberately no pending backlog.
     def send_gcode(self, gcode: str) -> bool:
-        """Send G-code script(s) to Klipper. Mirrors the Bambu contract:
-        True means dispatched, not completed. Homing and moves execute
-        synchronously inside Klipper's script processing, so the POST can
-        take as long as the motion itself — it runs on its own thread or
-        a 30s G28 would stall every (sync-in-async) route that calls this.
+        """Dispatch G-code script(s) to Klipper. Mirrors the Bambu
+        contract (True = dispatched, not completed), plus the
+        single-flight rule above: False while a previous motion is
+        still executing.
         """
         if not self.state.connected:
             logger.warning("[%s] Cannot send G-code: not connected", self.serial_number)
             return False
+        with self._gcode_lock:
+            if self._gcode_in_flight:
+                logger.warning("[%s] G-code refused: motion already in flight", self.serial_number)
+                return False
+            self._gcode_in_flight = True
 
         def _send() -> None:
             try:
                 self._post_json("/printer/gcode/script", {"script": gcode}, timeout=180)
             except Exception as e:
                 logger.warning(f"[{self.serial_number}] G-code failed ({gcode[:50]!r}): {e}")
+            finally:
+                with self._gcode_lock:
+                    self._gcode_in_flight = False
 
         threading.Thread(target=_send, daemon=True).start()
         return True

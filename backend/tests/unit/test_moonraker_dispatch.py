@@ -124,3 +124,59 @@ def test_send_gcode_refused_when_disconnected():
     assert not client.state.connected
     assert client.send_gcode("G28") is False
     assert _wait_for_post(client, timeout=0.2) == []
+
+
+def test_concurrent_motion_is_refused_not_queued():
+    # A second click while a home is executing must be refused outright:
+    # queueing it would run a stale jog minutes later, after the user has
+    # long forgotten clicking it.
+    import threading
+    import time
+
+    client = _idle_client()
+    release = threading.Event()
+    posted = []
+
+    def blocking_post(path, payload, timeout=30):
+        posted.append(payload["script"])
+        release.wait(timeout=5)
+        return {"result": "ok"}
+
+    client._post_json = blocking_post
+    assert client.send_gcode("G28") is True
+    assert client.send_gcode("G91\nG1 X10 F6000\nG90") is False
+    release.set()
+    deadline = time.monotonic() + 2.0
+    while client._gcode_in_flight and time.monotonic() < deadline:
+        time.sleep(0.01)
+    assert posted == ["G28"]
+    assert client.send_gcode("G91\nG1 X10 F6000\nG90") is True
+
+
+def test_failed_motion_releases_the_flight_slot():
+    # A POST that blows up (timeout, connection drop) must free the slot:
+    # the printer is not wedged out of motion controls until reconnect.
+    import time
+
+    client = _idle_client()
+    attempts = []
+
+    def flaky_post(path, payload, timeout=30):
+        attempts.append(payload["script"])
+        if len(attempts) == 1:
+            raise ConnectionError("dropped mid-home")
+        return {"result": "ok"}
+
+    client._post_json = flaky_post
+    assert client.send_gcode("G28") is True
+    deadline = time.monotonic() + 2.0
+    accepted = False
+    while time.monotonic() < deadline and not accepted:
+        accepted = client.send_gcode("M115")
+        if not accepted:
+            time.sleep(0.01)
+    assert accepted
+    deadline = time.monotonic() + 2.0
+    while len(attempts) < 2 and time.monotonic() < deadline:
+        time.sleep(0.01)
+    assert attempts == ["G28", "M115"]
