@@ -7592,13 +7592,16 @@ class PrintScheduler:
             await self._power_off_if_needed(db, item)
             return
 
-        # Moonraker exact-match guard: pinned-printer items get no compat
-        # check anywhere on the Bambu path, but a Bambu-dialect slice must
-        # never reach Klipper. Only a positively declared mismatch blocks —
-        # unknown sliced_for metadata falls through, same fail-safe as the
-        # nozzle guard below.
-        if uses_moonraker_transport(printer.model):
-            sliced_for = archive.sliced_for_model if archive else None
+        # Cross-transport exact-match guard: pinned-printer items get no
+        # compat check anywhere on the Bambu path, but a slice must never
+        # cross transports — Bambu-dialect G-code must not reach Klipper,
+        # and a Moonraker-declared file (admitted to the library for U1
+        # printers) must not be FTP'd to a Bambu as a fake 3MF. Only a
+        # positively declared mismatch blocks — unknown sliced_for
+        # metadata falls through, same fail-safe as the nozzle guard.
+        # Bambu-to-Bambu pinned behavior is unchanged (still unchecked).
+        sliced_for = archive.sliced_for_model if archive else None
+        if uses_moonraker_transport(printer.model) or uses_moonraker_transport(sliced_for):
             if sliced_for and not is_gcode_compatible(sliced_for, printer.model):
                 mismatch_msg = (
                     f"This file was sliced for {sliced_for}, not for {printer.model}. "

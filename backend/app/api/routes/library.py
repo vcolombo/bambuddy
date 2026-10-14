@@ -238,6 +238,29 @@ def calculate_file_hash(file_path: Path) -> str:
     return sha256_hash.hexdigest()
 
 
+def _declares_moonraker_model(content: bytes) -> bool:
+    """True when a raw G-code file declares a Moonraker printer model.
+
+    Klipper machines print raw .gcode, so a file sliced for one is a
+    legitimate library upload even though a Bambu would reject it. The
+    declaration must be positive evidence in the file itself (the
+    slicer's ``; printer_model =`` line, in the head or the trailing
+    CONFIG_BLOCK — Orca-family slicers append it at end of file), never
+    inferred from the filename: an undeclared or Bambu-declared file
+    keeps the #1401 rejection below.
+    """
+    from backend.app.utils.printer_models import normalize_printer_model, uses_moonraker_transport
+
+    scan = content[: 64 * 1024]
+    if len(content) > 64 * 1024:
+        scan += b"\n" + content[-64 * 1024 :]
+    match = re.search(rb";\s*printer_model\s*=\s*([^\r\n]+)", scan, re.IGNORECASE)
+    if not match:
+        return False
+    declared = normalize_printer_model(match.group(1).decode("utf-8", errors="ignore").strip())
+    return uses_moonraker_transport(declared)
+
+
 def validate_print_file_upload(filename: str, content: bytes) -> None:
     """Reject obviously-unprintable uploads early so the printer doesn't see them (#1401).
 
@@ -265,7 +288,7 @@ def validate_print_file_upload(filename: str, content: bytes) -> None:
     is_3mf_upload = lower_filename.endswith(".3mf")
     is_raw_gcode_upload = lower_filename.endswith(".gcode") and not lower_filename.endswith(".gcode.3mf")
 
-    if is_raw_gcode_upload:
+    if is_raw_gcode_upload and not _declares_moonraker_model(content):
         raise HTTPException(
             status_code=400,
             detail=(
