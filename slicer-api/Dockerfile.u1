@@ -1,0 +1,32 @@
+# Snapmaker U1 slicer sidecar: the maziggy/orca-slicer-api wrapper with the
+# stock OrcaSlicer binary swapped for Snapmaker's official OrcaSlicer fork.
+#
+# The wrapper is slicer-agnostic (it spawns $ORCASLICER_PATH and resolves
+# profile inheritance against $BUNDLED_PROFILES_PATH), so the image is
+# literally the upstream sidecar with a different AppImage extracted in.
+#
+# Pinned pair (bump together, deliberately — never float):
+#   wrapper: maziggy/orca-slicer-api (bambuddy/profile-resolver branch)
+#   slicer:  Snapmaker/OrcaSlicer v2.4.0 (matches the owner's installed build)
+#
+# Presets ship inside the Snapmaker bundle itself
+# (resources/profiles/Snapmaker), extracted at the stage below — the
+# bundle at the pinned revision is the preset source of truth.
+#
+# Build (linux/amd64 only, like the upstream images):
+#   docker build -f slicer-api/Dockerfile.u1 -t bambuddy-u1-slicer-api:local slicer-api/
+
+FROM ubuntu:24.04 AS extract
+ARG SNAPMAKER_ORCA_VERSION=2.4.0
+ARG SNAPMAKER_ORCA_APPIMAGE_URL=https://github.com/Snapmaker/OrcaSlicer/releases/download/v2.4.0/Snapmaker_Orca_Linux_AppImage_Ubuntu2404_V2.4.0.AppImage
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends ca-certificates curl \
+    && curl -fsSL -o /tmp/snapmaker-orca.AppImage "${SNAPMAKER_ORCA_APPIMAGE_URL}" \
+    && chmod +x /tmp/snapmaker-orca.AppImage \
+    && cd / && /tmp/snapmaker-orca.AppImage --appimage-extract \
+    && rm -rf /var/lib/apt/lists/*
+
+FROM maziggy/orca-slicer-api:latest
+COPY --from=extract /squashfs-root /opt/snapmaker-orca
+ENV ORCASLICER_PATH=/opt/snapmaker-orca/AppRun \
+    BUNDLED_PROFILES_PATH=/opt/snapmaker-orca/resources/profiles
