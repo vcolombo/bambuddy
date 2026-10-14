@@ -361,6 +361,28 @@ class _Liveness:
         )
 
 
+def _drop_wipe_tower_sentinel(process_profile_json: str) -> str:
+    """Remove a stringly ``wipe_tower_filament: "0"`` from a process preset.
+
+    Snapmaker's Orca fork ships that key as the string "0" in its leaf
+    presets; its own CLI segfaults loading a settings file that carries
+    it in that form (verified against 2.4.0: string crashes, int is
+    rejected with a fallback, omission is clean — and omission is also
+    semantically identical, because 0 is the compiled-in default
+    "use whichever extruder is available"). Only the exact string "0"
+    is dropped: an int or a non-zero pick is a real user choice and
+    passes through untouched, as does unparseable content.
+    """
+    try:
+        parsed = json.loads(process_profile_json)
+    except (json.JSONDecodeError, TypeError):
+        return process_profile_json
+    if isinstance(parsed, dict) and parsed.get("wipe_tower_filament") == "0":
+        parsed.pop("wipe_tower_filament")
+        return json.dumps(parsed)
+    return process_profile_json
+
+
 class SlicerApiService:
     """Talks to an OrcaSlicer / BambuStudio API sidecar."""
 
@@ -685,7 +707,10 @@ class SlicerApiService:
         files: list[tuple[str, tuple[str, bytes, str]]] = [
             ("file", (model_filename, model_bytes, _guess_model_content_type(model_filename))),
             ("printerProfile", ("printer.json", printer_profile_json.encode("utf-8"), "application/json")),
-            ("presetProfile", ("preset.json", process_profile_json.encode("utf-8"), "application/json")),
+            (
+                "presetProfile",
+                ("preset.json", _drop_wipe_tower_sentinel(process_profile_json).encode("utf-8"), "application/json"),
+            ),
         ]
         for idx, fjson in enumerate(filament_profile_jsons):
             files.append(
