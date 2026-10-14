@@ -78,6 +78,7 @@ from backend.app.utils.printer_models import (
     is_gcode_compatible,
     is_nozzle_rack_model,
     normalize_printer_model,
+    uses_moonraker_transport,
 )
 from backend.app.utils.threemf_tools import (
     default_plate_number,
@@ -7591,6 +7592,42 @@ class PrintScheduler:
             await self._power_off_if_needed(db, item)
             return
 
+        # Moonraker exact-match guard: pinned-printer items get no compat
+        # check anywhere on the Bambu path, but a Bambu-dialect slice must
+        # never reach Klipper. Only a positively declared mismatch blocks —
+        # unknown sliced_for metadata falls through, same fail-safe as the
+        # nozzle guard below.
+        if uses_moonraker_transport(printer.model):
+            sliced_for = archive.sliced_for_model if archive else None
+            if sliced_for and not is_gcode_compatible(sliced_for, printer.model):
+                mismatch_msg = (
+                    f"This file was sliced for {sliced_for}, not for {printer.model}. "
+                    "Re-slice it for this printer before queueing it here."
+                )
+                item.status = "failed"
+                item.error_message = mismatch_msg
+                item.completed_at = datetime.now(timezone.utc)
+                await db.commit()
+                logger.warning("Queue item %s: model mismatch — %s", item.id, mismatch_msg)
+                await notification_service.on_queue_job_failed(
+                    job_name=filename.replace(".gcode.3mf", "").replace(".3mf", ""),
+                    printer_id=printer.id,
+                    printer_name=printer.name,
+                    reason=mismatch_msg,
+                    db=db,
+                )
+                try:
+                    await ws_manager.send_queue_item_failed(
+                        user_id=item.created_by_id,
+                        queue_item_id=item.id,
+                        printer_id=item.printer_id,
+                        reason="model_mismatch",
+                    )
+                except Exception:
+                    pass
+                await self._power_off_if_needed(db, item)
+                return
+
         # Nozzle-diameter mismatch guard (#1899). A file sliced for one nozzle
         # size dispatched to a printer with a different nozzle installed is
         # rejected by the firmware with a cryptic HMS ("Failed to get AMS mapping
@@ -7696,8 +7733,15 @@ class PrintScheduler:
             print_dispatch_context.mark_pending(printer.id)
 
         # Upload to root directory (not /cache/) - the start_print command references
-        # files by name only (ftp://{filename}), so they must be in the root
-        remote_filename = derive_remote_filename(filename)
+        # files by name only (ftp://{filename}), so they must be in the root.
+        # Moonraker (Klipper) printers store the sliced file by its real
+        # name — derive_remote_filename appends the Bambu ".3mf" wrapper,
+        # which Klipper would neither accept as gcode nor find at start.
+        is_moonraker = uses_moonraker_transport(printer.model)
+        if is_moonraker:
+            remote_filename = Path(filename).name.replace(" ", "_")
+        else:
+            remote_filename = derive_remote_filename(filename)
         remote_path = f"/{remote_filename}"
 
         # Get FTP retry settings
@@ -7722,26 +7766,29 @@ class PrintScheduler:
         # pending->printing CAS) transparently open a fresh transaction.
         await db.commit()
 
-        # Delete existing file if present (avoids 553 error on overwrite)
-        try:
-            logger.debug("Queue item %s: Deleting existing file %s if present...", item.id, remote_path)
-            delete_result = await delete_file_async(
-                printer.ip_address,
-                printer.access_code,
-                remote_path,
-                socket_timeout=ftp_timeout,
-                printer_model=printer.model,
-                # This delete and the upload below are one bounded, user-initiated
-                # unit -- at most nine connections -- so neither skips on the
-                # handshake cool-off the opportunistic sweeps rely on. In #2898's
-                # trace this delete took the TLS failure and armed the cool-off,
-                # and the upload's four attempts were then spent against it
-                # without a socket being opened.
-                respect_handshake_cooloff=False,
-            )
-            logger.debug("Queue item %s: Delete result: %s", item.id, delete_result)
-        except Exception as e:
-            logger.debug("Queue item %s: Delete failed (may not exist): %s", item.id, e)
+        # Delete existing file if present (avoids 553 error on overwrite).
+        # Moonraker uploads overwrite by name over HTTP, and no Bambu FTP
+        # delete may be attempted against a Klipper machine (emit deny).
+        if not is_moonraker:
+            try:
+                logger.debug("Queue item %s: Deleting existing file %s if present...", item.id, remote_path)
+                delete_result = await delete_file_async(
+                    printer.ip_address,
+                    printer.access_code,
+                    remote_path,
+                    socket_timeout=ftp_timeout,
+                    printer_model=printer.model,
+                    # This delete and the upload below are one bounded, user-initiated
+                    # unit -- at most nine connections -- so neither skips on the
+                    # handshake cool-off the opportunistic sweeps rely on. In #2898's
+                    # trace this delete took the TLS failure and armed the cool-off,
+                    # and the upload's four attempts were then spent against it
+                    # without a socket being opened.
+                    respect_handshake_cooloff=False,
+                )
+                logger.debug("Queue item %s: Delete result: %s", item.id, delete_result)
+            except Exception as e:
+                logger.debug("Queue item %s: Delete failed (may not exist): %s", item.id, e)
 
         # Dispatch toast — announce the upload start with the total byte
         # count so the frontend can render an honest progress bar.
@@ -7775,7 +7822,19 @@ class PrintScheduler:
         upload_failure = FtpFailureReport()
 
         try:
-            if ftp_retry_enabled:
+            if is_moonraker:
+                # Klipper storage over HTTP: one multipart upload, overwrite
+                # by name, no FTP progress stream (the toast above already
+                # announced the byte count; the manager call is synchronous
+                # transport, so it runs off-loop).
+                data = await asyncio.to_thread(file_path.read_bytes)
+                uploaded = await asyncio.to_thread(printer_manager.upload_print_file, printer.id, data, remote_filename)
+                if not uploaded:
+                    upload_error = (
+                        "Upload to the printer failed. Check the printer is on and reachable, "
+                        "and that the file is sliced G-code the printer accepts."
+                    )
+            elif ftp_retry_enabled:
                 uploaded = await with_ftp_retry(
                     upload_file_async,
                     printer.ip_address,
@@ -7934,20 +7993,24 @@ class PrintScheduler:
                 "(cancelled or removed mid-dispatch) — aborting before MQTT send (#1853)",
                 item.id,
             )
-            try:
-                await delete_file_async(
-                    printer.ip_address,
-                    printer.access_code,
-                    remote_path,
-                    socket_timeout=ftp_timeout,
-                    printer_model=printer.model,
-                )
-            except Exception as cleanup_err:
-                logger.debug(
-                    "Queue item %s: best-effort cleanup of uploaded file failed: %s",
-                    item.id,
-                    cleanup_err,
-                )
+            # Moonraker: the staged file just stays in Klipper storage —
+            # it can only print when explicitly started, and no Bambu FTP
+            # delete may be attempted against it (emit deny).
+            if not is_moonraker:
+                try:
+                    await delete_file_async(
+                        printer.ip_address,
+                        printer.access_code,
+                        remote_path,
+                        socket_timeout=ftp_timeout,
+                        printer_model=printer.model,
+                    )
+                except Exception as cleanup_err:
+                    logger.debug(
+                        "Queue item %s: best-effort cleanup of uploaded file failed: %s",
+                        item.id,
+                        cleanup_err,
+                    )
             try:
                 await ws_manager.send_queue_item_failed(
                     user_id=toast_uid,
@@ -8213,22 +8276,29 @@ class PrintScheduler:
         # parses + injects it only for dual-nozzle models so a null on every
         # other model is a transparent pass-through. The rack fallback is
         # resolved down there too, where the live rack position is known.
-        started = printer_manager.start_print(
-            item.printer_id,
-            remote_filename,
-            plate_id=effective_plate_id,
-            ams_mapping=ams_mapping,
-            bed_levelling=item.bed_levelling,
-            flow_cali=item.flow_cali,
-            vibration_cali=item.vibration_cali,
-            layer_inspect=item.layer_inspect,
-            timelapse=effective_timelapse,
-            use_ams=effective_use_ams,
-            nozzle_offset_cali=item.nozzle_offset_cali,
-            nozzle_mapping=item.nozzle_mapping
+        start_kwargs = {
+            "plate_id": effective_plate_id,
+            "ams_mapping": ams_mapping,
+            "bed_levelling": item.bed_levelling,
+            "flow_cali": item.flow_cali,
+            "vibration_cali": item.vibration_cali,
+            "layer_inspect": item.layer_inspect,
+            "timelapse": effective_timelapse,
+            "use_ams": effective_use_ams,
+            "nozzle_offset_cali": item.nozzle_offset_cali,
+            "nozzle_mapping": item.nozzle_mapping
             or (json.dumps(resolved_nozzle_mapping) if resolved_nozzle_mapping else None),
-            nozzle_slot_extruders=nozzle_slot_extruders,
-        )
+            "nozzle_slot_extruders": nozzle_slot_extruders,
+        }
+        if is_moonraker:
+            # Moonraker start-by-name is a synchronous HTTP POST that can
+            # wait on Klipper; Bambu's is a fire-and-forget MQTT publish.
+            # Offload only the former so a slow start cannot stall the loop.
+            started = await asyncio.to_thread(
+                printer_manager.start_print, item.printer_id, remote_filename, **start_kwargs
+            )
+        else:
+            started = printer_manager.start_print(item.printer_id, remote_filename, **start_kwargs)
 
         if started:
             # The command is away, so the expectation is now legitimate and must
@@ -8254,7 +8324,7 @@ class PrintScheduler:
             # Register the local 3MF in the cover-cache so /cover skips FTP
             # (#1166 follow-up). file_path was resolved earlier from either the
             # archive or the library file row.
-            if file_path is not None:
+            if file_path is not None and not is_moonraker:
                 cache_3mf_download(item.printer_id, remote_filename, file_path)
 
             # Hold the printer against further dispatches until the watchdog
@@ -8326,16 +8396,18 @@ class PrintScheduler:
             except Exception:
                 pass  # Don't fail if MQTT fails
         else:
-            # Clean up uploaded file from SD card to prevent phantom prints
-            try:
-                await delete_file_async(
-                    printer.ip_address,
-                    printer.access_code,
-                    remote_path,
-                    printer_model=printer.model,
-                )
-            except Exception:
-                pass  # Best-effort — don't fail the error handler
+            # Clean up uploaded file from SD card to prevent phantom prints.
+            # Moonraker: skipped — see the mid-dispatch cancel cleanup above.
+            if not is_moonraker:
+                try:
+                    await delete_file_async(
+                        printer.ip_address,
+                        printer.access_code,
+                        remote_path,
+                        printer_model=printer.model,
+                    )
+                except Exception:
+                    pass  # Best-effort — don't fail the error handler
 
             # Busy-refusal is a deferral, not a failure (#2598). The printer's
             # state can flip from idle to active in the window between the

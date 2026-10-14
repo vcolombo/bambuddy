@@ -6874,19 +6874,17 @@ _SUBTASK_TRUNCATION_MARKER = "..."
 
 
 def _normalise_subtask_name(name: str) -> str:
-    """Canonical form for comparing a dispatched name against MQTT's echo.
+    """Canonical form for comparing a dispatched name against its echo.
 
-    The printer does not echo the name back verbatim: it substitutes
-    underscores for spaces. ``H2D_Carbon_Filter_(V2)_Body & Solid Lid`` is
-    dispatched and ``H2D_Carbon_Filter_(V2)_Body_&_Solid_Lid`` comes back.
-
-    The 3MF lookup in this module has always known that -- it builds
-    space-to-underscore variants of every candidate filename, and its
-    directory search normalises both sides before comparing. This exists so
-    the completion check reads the same rule from the same place instead of
-    growing its own, which is exactly how it came to disagree (#2829).
+    The printer does not echo the name back verbatim: Bambu substitutes
+    underscores for spaces, and a Moonraker printer echoes the full file
+    name including its ``.gcode`` extension, where Bambu echoes a bare
+    subtask name. Extensions therefore strip on both sides, via the same
+    helper the expected side already uses, so neither transport gets its
+    own comparison rule — which is exactly how they came to disagree
+    (#2829).
     """
-    return name.strip().replace(" ", "_").casefold()
+    return _subtask_name_from_filename(name.strip()).replace(" ", "_").casefold()
 
 
 def _subtask_names_match(expected: str, observed: str) -> bool:
