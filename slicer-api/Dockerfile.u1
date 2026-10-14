@@ -29,4 +29,4 @@ RUN apt-get update \
 FROM maziggy/orca-slicer-api:latest
 COPY --from=extract /squashfs-root /opt/snapmaker-orca
 ENV ORCASLICER_PATH=/opt/snapmaker-orca/AppRun \
-    BUNDLED_PROFILES_PATH=/opt/snapmaker-orca/resources/profiles
+    BUNDLED_PROFILES_PATH=/opt/snapmaker-orca/resources/profiles/Snapmaker
