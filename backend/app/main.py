@@ -3285,6 +3285,19 @@ async def _capture_snapshot_for_notification(printer_id: int, printer, logger) -
                 logger.info("[SNAPSHOT] External camera frame: %s bytes", len(frame_data))
                 return _apply_camera_rotation(frame_data, printer, logger)
 
+        # Moonraker machines have no Bambu camera protocol: stills come
+        # from the client's monitor/webcam capture (which also feeds the
+        # buffered-frame path when a viewer is streaming).
+        from backend.app.utils.printer_models import uses_moonraker_transport
+
+        if uses_moonraker_transport(printer.model):
+            client = printer_manager.get_client(printer_id)
+            frame_data = await asyncio.to_thread(client.capture_snapshot) if client else None
+            if frame_data and len(frame_data) <= 2_500_000:
+                logger.info("[SNAPSHOT] Moonraker camera frame: %s bytes", len(frame_data))
+                return _apply_camera_rotation(frame_data, printer, logger)
+            return None
+
         # Try buffered frame from active stream
         from backend.app.api.routes.camera import _active_chamber_streams, _active_streams, get_buffered_frame
 
@@ -5542,6 +5555,14 @@ async def _list_timelapse_videos(printer) -> tuple[list[dict], str | None]:
         logger.debug("[TIMELAPSE] Skipping the scan for printer %s: it reports no external storage", printer_id)
         return [], None
 
+    # Timelapses on a Moonraker printer live behind its file API, not
+    # Bambu FTP — and no FTP attempt may be made against it (emit deny).
+    # Report "no videos" until a Moonraker timelapse path exists.
+    from backend.app.utils.printer_models import uses_moonraker_transport
+
+    if uses_moonraker_transport(getattr(printer, "model", None)):
+        return [], None
+
     for timelapse_path in ["/timelapse", "/timelapse/video", "/record", "/recording"]:
         try:
             found_files = await list_files_async(
@@ -5674,6 +5695,16 @@ async def _scan_for_timelapse_with_retries(archive_id: int, baseline_names: set[
                 return
             if not archive.printer_id:
                 logger.warning("[TIMELAPSE] Archive %s has no printer, aborting", archive_id)
+                return
+
+            # Moonraker: no Bambu-FTP timelapse scan (see _list_timelapse_videos).
+            from backend.app.utils.printer_models import uses_moonraker_transport
+
+            printer_row = await db.get(Printer, archive.printer_id)
+            if printer_row is not None and uses_moonraker_transport(printer_row.model):
+                logger.info(
+                    "[TIMELAPSE] Archive %s: Moonraker printer — timelapse scan not supported, skipping", archive_id
+                )
                 return
 
             if baseline_names is not None:

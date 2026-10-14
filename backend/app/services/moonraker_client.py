@@ -19,7 +19,7 @@ import urllib.request
 from collections.abc import Callable
 from typing import Any
 
-from backend.app.services.bambu_mqtt import PrinterState
+from backend.app.services.bambu_mqtt import HMSError, PrinterState
 
 logger = logging.getLogger(__name__)
 
@@ -467,6 +467,7 @@ class MoonrakerClient:
             s.chamber_light,
             s.cooling_fan_speed,
             s.big_fan2_speed,
+            tuple((e.code, e.description) for e in (s.hms_errors or [])),
         )
 
     def _apply(self, info: dict[str, Any], s: dict[str, Any]) -> None:
@@ -528,6 +529,29 @@ class MoonrakerClient:
         state.big_fan2_speed = round(float(s.get("fan_generic cavity_fan", {}).get("speed") or 0.0) * 100)
         color_data = s.get("led cavity_led", {}).get("color_data") or []
         state.chamber_light = any(any(channel > 0 for channel in led) for led in color_data)
+
+        # Surface Klipper's own exception ("detected dirty bed", runout,
+        # ...) through the HMS shape every consumer already renders, so
+        # the card explains a pause instead of naming it bare. The code
+        # space is Snapmaker's, not Bambu's catalogue: description is the
+        # printer's own sentence and actions stay empty (no HMS command
+        # may be offered for it).
+        exc = stats.get("exception") or {}
+        message = exc.get("message") or stats.get("message")
+        if message:
+            exc_id = exc.get("id", exc.get("code", "klipper"))
+            state.hms_errors = [
+                HMSError(
+                    code=str(exc_id),
+                    attr=0,
+                    module=0,
+                    severity=min(3, max(1, int(exc.get("level") or 2))),
+                    description=str(message),
+                    full_code=str(exc_id),
+                )
+            ]
+        else:
+            state.hms_errors = []
 
     def _active_tool_index(self, klippy_name: str) -> str:
         for tool, name in TOOLS.items():

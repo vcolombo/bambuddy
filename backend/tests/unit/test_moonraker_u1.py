@@ -606,3 +606,72 @@ async def test_moonraker_completion_clears_the_queue_item():
     assert final.status == "completed"
     assert final.completed_at is not None
     await engine.dispose()
+
+
+def test_klipper_exception_surfaces_as_hms_error_with_its_sentence():
+    # The card must say WHY it paused ("detected dirty bed"), in the HMS
+    # shape every consumer renders - not a bare PAUSE.
+    client = FakeMoonrakerClient(ip_address="192.168.4.102", serial_number="U1TEST")
+    status = _status("paused", "cube.gcode", 0.0, 0, 62)
+    status["print_stats"]["exception"] = {"id": 532, "code": 1, "message": "detected dirty bed", "level": 2}
+    status["print_stats"]["message"] = "detected dirty bed"
+    client.payloads["status"] = status
+    client._poll_once()
+    errors = client.state.hms_errors
+    assert len(errors) == 1
+    assert errors[0].description == "detected dirty bed"
+    assert errors[0].severity == 2
+    assert errors[0].actions == []
+
+    client.payloads["status"] = _status("printing", "cube.gcode", 0.1, 1, 62)
+    client._poll_once()
+    assert client.state.hms_errors == []
+
+
+@pytest.mark.asyncio
+async def test_timelapse_listing_never_attempts_ftp_for_u1():
+    from types import SimpleNamespace
+    from unittest.mock import AsyncMock, patch
+
+    from backend.app.main import _list_timelapse_videos
+
+    printer = SimpleNamespace(id=1, model="U1", ip_address="192.168.4.102", access_code="")
+    with patch("backend.app.services.bambu_ftp.list_files_async", new=AsyncMock(return_value=[])) as mock_list:
+        videos, path = await _list_timelapse_videos(printer)
+    assert (videos, path) == ([], None)
+    mock_list.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_notification_snapshot_uses_moonraker_capture_not_bambu_camera():
+    import logging
+    from types import SimpleNamespace
+    from unittest.mock import AsyncMock, MagicMock, patch
+
+    from backend.app.main import _capture_snapshot_for_notification
+    from backend.app.services.printer_manager import printer_manager as real_manager
+
+    client = FakeMoonrakerClient(ip_address="192.168.4.102", serial_number="U1TEST")
+    client._poll_once()
+    client.capture_snapshot = MagicMock(return_value=b"\xff\xd8frame\xff\xd9")
+    real_manager._clients[77] = client
+    real_manager._models[77] = "U1"
+
+    session = AsyncMock()
+    session.__aenter__ = AsyncMock(return_value=session)
+    session.__aexit__ = AsyncMock()
+    session.execute = AsyncMock(return_value=MagicMock(scalar_one_or_none=MagicMock(return_value=None)))
+
+    printer = SimpleNamespace(model="U1", external_camera_enabled=False, external_camera_url=None, camera_rotation=0)
+    try:
+        with (
+            patch("backend.app.main.async_session", return_value=session),
+            patch("backend.app.services.camera.capture_camera_frame_bytes", new_callable=AsyncMock) as bambu_capture,
+        ):
+            frame = await _capture_snapshot_for_notification(77, printer, logging.getLogger("test"))
+    finally:
+        real_manager._clients.pop(77, None)
+        real_manager._models.pop(77, None)
+
+    assert frame == b"\xff\xd8frame\xff\xd9"
+    bambu_capture.assert_not_awaited()
