@@ -47,6 +47,7 @@ from backend.app.services.camera_fanout import (
 )
 from backend.app.services.camera_profiles import get_camera_profile
 from backend.app.utils.ffmpeg_output import summarize_ffmpeg_stderr
+from backend.app.utils.printer_models import uses_moonraker_transport
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/printers", tags=["camera"])
@@ -941,6 +942,64 @@ async def create_stream_token(
     return {"token": await create_camera_stream_token()}
 
 
+async def generate_moonraker_mjpeg_stream(
+    ip_address: str,
+    access_code: str,
+    model: str | None,
+    fps: int = 1,
+    stream_id: str | None = None,
+    disconnect_event: asyncio.Event | None = None,
+    printer_id: int | None = None,
+) -> AsyncGenerator[bytes, None]:
+    """Pseudo-live MJPEG for Moonraker printers (Snapmaker U1).
+
+    The U1 chamber camera has no RTSP/chamber-protocol stream: its repeater
+    monitor writes ~1 JPEG/s to monitor.jpg. This polls that still and wraps
+    it in the same multipart shape the other generators emit, so the
+    fan-out broadcaster and every viewer work unchanged. Same signature as
+    generate_chamber_mjpeg_stream; ip_address/access_code/model are unused
+    because the manager's connected client already owns the transport.
+    """
+    from backend.app.services.printer_manager import printer_manager
+
+    logger.info("Starting Moonraker snapshot stream for printer %s (stream_id=%s)", printer_id, stream_id)
+    if stream_id and disconnect_event:
+        _disconnect_events[stream_id] = disconnect_event
+
+    client = printer_manager.get_client(printer_id) if printer_id is not None else None
+    if client is None:
+        yield (
+            b"--frame\r\n"
+            b"Content-Type: text/plain\r\n\r\n"
+            b"Error: Printer not connected. Check the printer is on and reachable.\r\n"
+        )
+        return
+
+    frame_interval = 1.0 / max(1, min(fps, 2))
+    try:
+        while not (disconnect_event and disconnect_event.is_set()):
+            frame = await asyncio.to_thread(client.capture_snapshot)
+            if frame:
+                if printer_id is not None:
+                    _last_frames[printer_id] = frame
+                    _last_frame_times[printer_id] = time.time()
+                yield (
+                    b"--frame\r\n"
+                    b"Content-Type: image/jpeg\r\n"
+                    b"Content-Length: " + str(len(frame)).encode() + b"\r\n"
+                    b"\r\n" + frame + b"\r\n"
+                )
+            await asyncio.sleep(frame_interval)
+    except asyncio.CancelledError:
+        logger.info("Moonraker snapshot stream cancelled (stream_id=%s)", stream_id)
+    except GeneratorExit:
+        logger.info("Moonraker snapshot stream generator exit (stream_id=%s)", stream_id)
+    finally:
+        if stream_id:
+            _disconnect_events.pop(stream_id, None)
+        logger.info("Moonraker snapshot stream stopped for printer %s (stream_id=%s)", printer_id, stream_id)
+
+
 @router.get("/{printer_id}/camera/stream")
 async def camera_stream(
     printer_id: int,
@@ -1081,14 +1140,19 @@ async def camera_stream(
             },
         )
 
-    # Validate FPS - A1/P1 models max out at ~5 FPS
-    if is_chamber_image_model(printer.model):
+    # Validate FPS - A1/P1 models max out at ~5 FPS, the U1 monitor at ~1
+    if uses_moonraker_transport(printer.model):
+        fps = min(max(fps, 1), 2)
+    elif is_chamber_image_model(printer.model):
         fps = min(max(fps, 1), 5)
     else:
         fps = min(max(fps, 1), 30)
 
     # Choose the appropriate stream generator based on model
-    if is_chamber_image_model(printer.model):
+    if uses_moonraker_transport(printer.model):
+        stream_generator = generate_moonraker_mjpeg_stream
+        logger.info("Using Moonraker snapshot stream for %s", printer.model)
+    elif is_chamber_image_model(printer.model):
         stream_generator = generate_chamber_mjpeg_stream
         logger.info("Using chamber image protocol for %s", printer.model)
     else:
@@ -1300,6 +1364,28 @@ async def camera_snapshot(
             raise HTTPException(
                 status_code=503,
                 detail="Failed to capture frame from external camera.",
+            )
+        return Response(
+            content=frame_data,
+            media_type="image/jpeg",
+            headers={
+                "Cache-Control": "no-cache, no-store, must-revalidate",
+                "Content-Disposition": f'inline; filename="snapshot_{printer_id}.jpg"',
+            },
+        )
+
+    # Moonraker machines (Snapmaker U1) have no RTSP/ffmpeg path: stills
+    # come from the repeater camera monitor (monitor.jpg). The transport is
+    # synchronous, so it runs off-loop like every other Moonraker call.
+    if uses_moonraker_transport(printer.model):
+        from backend.app.services.printer_manager import printer_manager
+
+        client = printer_manager.get_client(printer_id)
+        frame_data = await asyncio.to_thread(client.capture_snapshot) if client else None
+        if not frame_data:
+            raise HTTPException(
+                status_code=503,
+                detail="Failed to capture frame from Moonraker camera.",
             )
         return Response(
             content=frame_data,

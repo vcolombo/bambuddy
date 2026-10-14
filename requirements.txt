@@ -119,6 +119,11 @@ idna>=3.15
 # HTTP client (used for OIDC token exchange)
 httpx>=0.26.0
 
+# Websocket client for Moonraker (Klipper) printers: the Snapmaker U1's
+# camera/system repeater endpoints are websocket/MQTT-only (no HTTP), and
+# live status subscriptions will ride the same transport.
+websockets>=14.0
+
 # CA bundle. Already a transitive dep of httpx, but services/makerworld.py
 # imports it directly to pin the S3 presigned download's urllib opener to the
 # same trust store httpx uses — the Windows OS store lacks the Amazon root

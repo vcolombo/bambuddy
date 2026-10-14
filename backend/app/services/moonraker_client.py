@@ -79,6 +79,8 @@ class MoonrakerClient:
         self._last_poll_time = 0.0
         self._active_job: str | None = None
         self._first_poll = True
+        self._monitor_started_at = 0.0
+        self._monitor_attempt_at = 0.0
         self._prev_progress: int | None = None
         self._prev_layer: int | None = None
 
@@ -123,6 +125,142 @@ class MoonrakerClient:
         )
         with urllib.request.urlopen(req, timeout=120) as resp:
             return json.load(resp)
+
+    def _get_bytes(self, path: str) -> bytes:
+        with urllib.request.urlopen(self.base_url + path, timeout=15) as resp:
+            return resp.read()
+
+    def _ws_call(self, method: str, params: dict[str, Any]) -> Any:
+        """One JSON-RPC call over a short-lived Moonraker websocket.
+
+        The Snapmaker repeater endpoints (camera/*, system/*) accept every
+        transport except HTTP, so they ride this instead of _post_json.
+        Notifications interleaved before the response are skipped.
+        """
+        from websockets.sync.client import connect as ws_connect
+
+        host = self.ip_address if ":" in self.ip_address else f"{self.ip_address}:{MOONRAKER_DEFAULT_PORT}"
+        with ws_connect(f"ws://{host}/websocket", open_timeout=10) as ws:
+            ws.send(
+                json.dumps(
+                    {
+                        "jsonrpc": "2.0",
+                        "method": "server.connection.identify",
+                        "params": {
+                            "client_name": "bambuddy",
+                            "version": "1.0",
+                            "type": "web",
+                            "url": "http://localhost",
+                        },
+                        "id": 1,
+                    }
+                )
+            )
+            json.loads(ws.recv(timeout=10))
+            ws.send(json.dumps({"jsonrpc": "2.0", "method": method, "params": params, "id": 2}))
+            for _ in range(10):
+                msg = json.loads(ws.recv(timeout=15))
+                if msg.get("id") != 2:
+                    continue
+                if "error" in msg:
+                    raise RuntimeError(msg["error"].get("message", "Moonraker websocket error"))
+                return msg.get("result")
+        raise RuntimeError(f"No response to {method}")
+
+    # Camera monitor lifecycle (hardware-verified community findings): the
+    # firmware stops the monitor ~6 min after the last start_monitor, first
+    # frame lands ~1.1s after a cold start, and start_monitor must not be
+    # hammered (5s cooldown).
+    MONITOR_RENEW_SECONDS = 240.0
+    MONITOR_COOLDOWN_SECONDS = 5.0
+    # A running monitor writes ~1 frame/s, so an mtime that does not advance
+    # within FRAME_ADVANCE_TIMEOUT means it is not running; after a (re)start
+    # the first frame lands ~1.1s in, so START_ADVANCE_TIMEOUT is generous.
+    FRAME_ADVANCE_TIMEOUT = 2.5
+    START_ADVANCE_TIMEOUT = 5.0
+    ADVANCE_POLL_SECONDS = 0.25
+
+    def _monitor_mtime(self) -> float | None:
+        """Printer-side mtime of monitor.jpg, or None when the file is absent.
+
+        Transport errors propagate: "could not look" must never read as
+        "no file", or a failed lookup would pass for a fresh start.
+        """
+        entries = self._get("/server/files/list", {"root": "camera"})
+        for entry in entries or []:
+            if entry.get("path") == "monitor.jpg":
+                return float(entry.get("modified") or 0)
+        return None
+
+    def _wait_for_advance(self, baseline: float | None, timeout: float) -> float | None:
+        """Poll until monitor.jpg's mtime exceeds ``baseline``; None on timeout.
+
+        Compares the printer's own timestamps with each other, so host/printer
+        clock skew cannot make a dead camera look alive. A file appearing
+        where there was none counts as an advance.
+        """
+        deadline = time.monotonic() + timeout
+        while True:
+            mtime = self._monitor_mtime()
+            if mtime is not None and (baseline is None or mtime > baseline):
+                return mtime
+            if time.monotonic() >= deadline:
+                return None
+            time.sleep(self.ADVANCE_POLL_SECONDS)
+
+    @staticmethod
+    def _is_complete_jpeg(frame: bytes) -> bool:
+        """SOI at the head and EOI at the tail: rejects torn or foreign bytes."""
+        return frame.startswith(b"\xff\xd8") and frame.rstrip(b"\x00").endswith(b"\xff\xd9")
+
+    def _ensure_monitor(self) -> bool:
+        """Start (or renew) the camera monitor. Returns True if (re)started."""
+        now = time.time()
+        if now - self._monitor_attempt_at < self.MONITOR_COOLDOWN_SECONDS:
+            return False
+        self._monitor_attempt_at = now
+        result = self._ws_call(
+            "camera.start_monitor",
+            {"req_id": int(now * 1000) % 2_147_483_647, "domain": "lan", "interval": 0},
+        )
+        if not (isinstance(result, dict) and result.get("state") == "success"):
+            raise RuntimeError(f"camera.start_monitor refused: {result!r}")
+        self._monitor_started_at = now
+        return True
+
+    def capture_snapshot(self) -> bytes | None:
+        """Capture one fresh JPEG still via the repeater monitor, or None.
+
+        "Fresh" is proven, not assumed: monitor.jpg's printer-side mtime must
+        advance while we watch. If it does not (monitor stopped, or a
+        start_monitor that succeeded but never produced a frame), the monitor
+        is restarted and advancement is required again — otherwise None. The
+        caller may stamp the result as current (the frame buffer feeds plate
+        checks), so a stale file must never come back as a success.
+
+        Keeps the monitor warm across calls (renewed before the firmware's
+        6-minute auto-stop) and never stops it explicitly: other viewers may
+        be watching, and the firmware reaps an idle monitor itself.
+        """
+        try:
+            baseline = self._monitor_mtime()
+            advanced: float | None = None
+            if time.time() - self._monitor_started_at <= self.MONITOR_RENEW_SECONDS:
+                advanced = self._wait_for_advance(baseline, self.FRAME_ADVANCE_TIMEOUT)
+            if advanced is None:
+                self._ensure_monitor()
+                advanced = self._wait_for_advance(baseline, self.START_ADVANCE_TIMEOUT)
+            if advanced is None:
+                logger.warning(f"[{self.serial_number}] camera monitor produced no new frame; not serving stale image")
+                return None
+            frame = self._get_bytes("/server/files/camera/monitor.jpg")
+            if not self._is_complete_jpeg(frame):
+                logger.warning(f"[{self.serial_number}] camera frame is not a complete JPEG; discarding")
+                return None
+            return frame
+        except Exception as e:
+            logger.warning(f"[{self.serial_number}] camera snapshot failed: {e}")
+            return None
 
     def _poll_once(self) -> bool:
         """Fetch status and fold it into ``self.state``. Returns reachability."""
