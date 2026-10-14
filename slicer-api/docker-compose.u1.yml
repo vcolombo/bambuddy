@@ -1,0 +1,35 @@
+# Snapmaker U1 slicer sidecar — standalone stack.
+#
+# Usage:
+#   cd slicer-api/
+#   docker compose -f docker-compose.u1.yml up -d --build
+#
+# Then in Bambuddy: Settings -> Slicer
+#   Preferred slicer:  OrcaSlicer
+#   Use Slicer API:    on
+#   OrcaSlicer URL:    http://<this-host>:3004
+#
+# linux/amd64 only (the Snapmaker AppImage is amd64), like the upstream
+# sidecar images. Port 3004 keeps clear of the stock Orca sidecar (3003)
+# and Bambuddy's virtual-printer reservations (3000/3002), so a U1 sidecar
+# can run alongside the Bambu one.
+
+services:
+  snapmaker-u1-slicer-api:
+    build:
+      context: .
+      dockerfile: Dockerfile.u1
+    image: bambuddy-u1-slicer-api:local
+    container_name: bambuddy-u1-slicer
+    restart: unless-stopped
+    ports:
+      - "${U1_SLICER_PORT:-3004}:3000"
+    volumes:
+      - bambuddy_u1_slicer_data:/app/data
+    environment:
+      NODE_ENV: production
+      PORT: "3000"
+      MAX_MODEL_UPLOAD_MB: "${MAX_MODEL_UPLOAD_MB:-512}"
+
+volumes:
+  bambuddy_u1_slicer_data:

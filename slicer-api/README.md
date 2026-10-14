@@ -179,3 +179,34 @@ exist you would silently switch between them and back.
       --load-filaments /path/to/filament.json \
       --allow-newer-file --outputdir /tmp/out /path/to/model.3mf
   ```
+
+## Snapmaker U1 sidecar
+
+For Moonraker (Klipper) printers. Same wrapper, with Snapmaker's official
+OrcaSlicer fork as the slicing binary (`Dockerfile.u1`): the wrapper is
+slicer-agnostic — it spawns `$ORCASLICER_PATH` and resolves profiles
+against `$BUNDLED_PROFILES_PATH` — so the U1 image swaps the extracted
+AppImage and points those at it.
+
+```bash
+cd slicer-api/
+docker compose -f docker-compose.u1.yml up -d --build
+curl http://localhost:3004/health
+```
+
+Then in Bambuddy: **Settings → Slicer** → Preferred slicer
+**OrcaSlicer**, **Use Slicer API** on, **OrcaSlicer URL**
+`http://<this-host>:3004`.
+
+**Pinned pair** (deliberately never floated; bump together, like
+`SIDECAR_TAG`): Snapmaker `OrcaSlicer` **v2.4.0** and the presets bundled
+inside that AppImage (`resources/profiles/Snapmaker`) — the bundle at
+the pinned revision is the preset source of truth, the same extraction
+that was test-sliced against `Snapmaker U1 (0.4 nozzle)` /
+`0.20mm High Quality` / `Snapmaker PLA Basic @U1`.
+
+One Snapmaker-fork quirk to know: its leaf presets ship
+`wipe_tower_filament` as the string `"0"`, which its own CLI segfaults
+on when the key arrives in a flat settings file. Bambuddy strips that
+exact sentinel before POSTing (omission is semantically identical —
+0 is the compiled-in default); a non-zero user pick is untouched.
