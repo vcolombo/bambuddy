@@ -511,3 +511,98 @@ def test_plain_gcode_trailer_model_reaches_sliced_for(tmp_path, declared, expect
     path.write_bytes(b"; generated\n" + filler + f"; printer_model = {declared}\n".encode())
 
     assert ThreeMFParser(path).parse().get("sliced_for_model") == expected
+
+
+@pytest.mark.asyncio
+async def test_moonraker_completion_clears_the_queue_item():
+    """Lifecycle close-out: a Moonraker completion payload (subtask name
+    carrying its .gcode extension, Klipper-style) must match the printing
+    queue item and move it out of "printing". Before the symmetric
+    extension normalisation this comparison failed and the row stranded.
+    """
+    from unittest.mock import AsyncMock, MagicMock, patch
+
+    from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
+
+    import backend.app.models  # noqa: F401 - populate Base.metadata
+    from backend.app.core.database import Base
+    from backend.app.main import (
+        _active_prints,
+        _expected_print_creators,
+        _expected_print_registered_at,
+        _expected_prints,
+        _print_ams_mappings,
+        _timelapse_baselines,
+    )
+    from backend.app.models.archive import PrintArchive
+    from backend.app.models.print_queue import PrintQueueItem
+    from backend.app.models.printer import Printer
+    from backend.tests._fixtures.background_tasks import discarding_spawn_patch
+
+    for d in (
+        _active_prints,
+        _expected_prints,
+        _expected_print_creators,
+        _expected_print_registered_at,
+        _print_ams_mappings,
+        _timelapse_baselines,
+    ):
+        d.clear()
+
+    engine = create_async_engine("sqlite+aiosqlite:///:memory:", echo=False)
+    async with engine.begin() as conn:
+        await conn.run_sync(Base.metadata.create_all)
+    session_maker = async_sessionmaker(engine, expire_on_commit=False)
+
+    async with session_maker() as db:
+        printer = Printer(
+            name="Snapmaker U1", serial_number="U1TEST", ip_address="192.168.4.102", access_code="", model="U1"
+        )
+        db.add(printer)
+        await db.flush()
+        archive = PrintArchive(
+            printer_id=printer.id,
+            filename="tolerance.gcode",
+            file_path="archives/tolerance.gcode",
+            file_size=10,
+            status="printing",
+        )
+        db.add(archive)
+        await db.flush()
+        item = PrintQueueItem(printer_id=printer.id, archive_id=archive.id, status="printing")
+        db.add(item)
+        await db.commit()
+        printer_id, item_id = printer.id, item.id
+
+    with (
+        patch("backend.app.main.async_session", session_maker),
+        patch("backend.app.core.database.async_session", session_maker),
+        patch("backend.app.main.ws_manager") as mock_ws,
+        patch("backend.app.main.printer_manager") as mock_pm,
+        patch("backend.app.main.mqtt_relay") as mock_relay,
+        patch("backend.app.main.notification_service") as mock_notif,
+        patch("backend.app.main.clear_3mf_cache"),
+        patch("backend.app.services.usage_tracker.on_print_complete", new_callable=AsyncMock, return_value=None),
+        discarding_spawn_patch(),
+    ):
+        mock_ws.send_print_complete = AsyncMock()
+        mock_relay.on_print_complete = AsyncMock()
+        mock_notif.on_print_complete = AsyncMock()
+        mock_pm.get_printer = MagicMock(return_value=MagicMock(name="Snapmaker U1", serial_number="U1TEST"))
+        mock_pm.get_current_print_user = MagicMock(return_value=None)
+        mock_pm.clear_current_print_user = MagicMock()
+        mock_pm.set_awaiting_plate_clear = MagicMock()
+
+        from backend.app.main import on_print_complete
+
+        # Exactly what MoonrakerClient._track_job fires.
+        await on_print_complete(
+            printer_id,
+            {"status": "completed", "filename": "tolerance.gcode", "subtask_name": "tolerance.gcode"},
+        )
+
+    async with session_maker() as db:
+        final = await db.get(PrintQueueItem, item_id)
+    assert final.status == "completed"
+    assert final.completed_at is not None
+    await engine.dispose()
