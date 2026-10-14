@@ -12,6 +12,9 @@ from backend.tests.unit.test_moonraker_u1 import FakeMoonrakerClient
 
 JPEG = b"\xff\xd8" + b"frame-bytes" + b"\xff\xd9"
 
+JPEG_B = b"\xff\xd8" + b"second-frame" + b"\xff\xd9"
+JPEG_C = b"\xff\xd8" + b"cached-frame" + b"\xff\xd9"
+
 
 class IncompleteReadStandIn(Exception):
     """http.client.IncompleteRead is an Exception subclass; any one will do."""
@@ -24,7 +27,7 @@ class CameraFake(FakeMoonrakerClient):
     repeats), which is how a frozen file is expressed.
     """
 
-    def __init__(self, *args, mtimes, frame=JPEG, start_result=None, advance_on_start=None, **kwargs):
+    def __init__(self, *args, mtimes, frame=JPEG, start_result=None, advance_on_start=None, webcam="", **kwargs):
         super().__init__(*args, **kwargs)
         self.FRAME_ADVANCE_TIMEOUT = 0.05
         self.START_ADVANCE_TIMEOUT = 0.05
@@ -33,6 +36,7 @@ class CameraFake(FakeMoonrakerClient):
         self.FETCH_RETRY_SECONDS = 0.005
         self._mtimes = list(mtimes)
         # One outcome per read (last repeats): bytes, or an Exception to raise.
+        self.WEBCAM_PROOF_GAP_SECONDS = 0.005
         self._frames = list(frame) if isinstance(frame, list) else [frame]
         self._start_result = start_result if start_result is not None else {"state": "success"}
         # A real start_monitor makes the firmware write a new frame; model
@@ -40,8 +44,12 @@ class CameraFake(FakeMoonrakerClient):
         # stays expressible.
         self._advance_on_start = advance_on_start
         self.start_calls = 0
+        self._webcam = webcam
 
     def _get(self, path, params=None):
+        if path == "/server/webcams/list":
+            cams = [{"name": "case", "enabled": True, "snapshot_url": self._webcam}] if self._webcam else []
+            return {"webcams": cams}
         if path == "/server/files/list":
             mtime = self._mtimes.pop(0) if len(self._mtimes) > 1 else self._mtimes[0]
             return [] if mtime is None else [{"path": "monitor.jpg", "modified": mtime}]
@@ -135,3 +143,48 @@ def test_reads_that_never_arrive_complete_give_up_as_none():
     client = _client(mtimes=[100.0, 101.0], frame=torn)
     client._monitor_started_at = time.time()
     assert client.capture_snapshot() is None
+
+
+def test_webcam_service_is_preferred_over_the_monitor():
+    # Extended firmware registers a camerastreamer webcam: real frame
+    # rates, no start_monitor dance at all. The served frame is the
+    # second fetch — the advance observed inside the capture.
+    client = _client(mtimes=[100.0], frame=[JPEG, JPEG_B], webcam="/webcam/snapshot.jpg")
+    assert client.capture_snapshot() == JPEG_B
+    assert client.start_calls == 0
+
+
+def test_webcam_snapshot_url_resolves_against_printer_host():
+    client = _client(mtimes=[100.0], webcam="/webcam/snapshot.jpg")
+    assert client._resolve_webcam_snapshot_url() == "http://192.168.4.102/webcam/snapshot.jpg"
+
+
+def test_frozen_webcam_first_capture_returns_none():
+    # A dead service serving one cached frame forever: "different from
+    # nothing" is not proof of life. Fall through to the monitor, which
+    # is frozen here, so the only honest answer is None.
+    client = _client(mtimes=[100.0], webcam="/webcam/snapshot.jpg")
+    assert client.capture_snapshot() is None
+    assert client.start_calls == 1  # the fallback at least tried the monitor
+
+
+def test_frozen_webcam_after_idle_gap_returns_none():
+    # The cached frame differs from what was served before the gap, so a
+    # naive hash comparison would call it fresh. Proof must be observed
+    # during this capture once the proof window has expired.
+    client = _client(mtimes=[100.0], frame=[JPEG, JPEG_B, JPEG_C], webcam="/webcam/snapshot.jpg")
+    assert client.capture_snapshot() == JPEG_B
+    client._webcam_proven_at -= client.WEBCAM_PROOF_WINDOW_SECONDS + 60
+    assert client.capture_snapshot() is None
+    assert client.start_calls == 1
+
+
+def test_webcam_failure_falls_back_to_the_monitor():
+    client = _client(
+        mtimes=[100.0, 101.0],
+        frame=[ConnectionError("webcam down"), JPEG],
+        webcam="/webcam/snapshot.jpg",
+    )
+    client._monitor_started_at = time.time()
+    assert client.capture_snapshot() == JPEG
+    assert client.start_calls == 0

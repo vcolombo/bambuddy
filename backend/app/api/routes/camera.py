@@ -975,9 +975,14 @@ async def generate_moonraker_mjpeg_stream(
         )
         return
 
-    frame_interval = 1.0 / max(1, min(fps, 2))
+    # The webcam-service path sustains ~10 fps; the stock monitor path
+    # paces itself (capture waits for a fresh frame), so a high cap is
+    # harmless there. Pace by elapsed time so capture latency counts
+    # toward the interval instead of adding to it.
+    frame_interval = 1.0 / max(1, min(fps, 10))
     try:
         while not (disconnect_event and disconnect_event.is_set()):
+            started = time.monotonic()
             frame = await asyncio.to_thread(client.capture_snapshot)
             if frame:
                 if printer_id is not None:
@@ -989,7 +994,7 @@ async def generate_moonraker_mjpeg_stream(
                     b"Content-Length: " + str(len(frame)).encode() + b"\r\n"
                     b"\r\n" + frame + b"\r\n"
                 )
-            await asyncio.sleep(frame_interval)
+            await asyncio.sleep(max(0.0, frame_interval - (time.monotonic() - started)))
     except asyncio.CancelledError:
         logger.info("Moonraker snapshot stream cancelled (stream_id=%s)", stream_id)
     except GeneratorExit:
@@ -1140,9 +1145,10 @@ async def camera_stream(
             },
         )
 
-    # Validate FPS - A1/P1 models max out at ~5 FPS, the U1 monitor at ~1
+    # Validate FPS - A1/P1 max ~5; Moonraker stills ~10 via webcam service
+    # (the stock monitor path self-paces near 1 fps regardless)
     if uses_moonraker_transport(printer.model):
-        fps = min(max(fps, 1), 2)
+        fps = min(max(fps, 1), 10)
     elif is_chamber_image_model(printer.model):
         fps = min(max(fps, 1), 5)
     else:

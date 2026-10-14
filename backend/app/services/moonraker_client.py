@@ -81,6 +81,9 @@ class MoonrakerClient:
         self._first_poll = True
         self._monitor_started_at = 0.0
         self._monitor_attempt_at = 0.0
+        self._webcam_snapshot_url: str | None = None
+        self._last_frame_hash: str | None = None
+        self._webcam_proven_at = 0.0
         self._gcode_in_flight = False
         self._gcode_lock = threading.Lock()
         self._prev_progress: int | None = None
@@ -129,7 +132,8 @@ class MoonrakerClient:
             return json.load(resp)
 
     def _get_bytes(self, path: str) -> bytes:
-        with urllib.request.urlopen(self.base_url + path, timeout=15) as resp:
+        url = path if path.startswith("http") else self.base_url + path
+        with urllib.request.urlopen(url, timeout=15) as resp:
             return resp.read()
 
     def _ws_call(self, method: str, params: dict[str, Any]) -> Any:
@@ -181,6 +185,84 @@ class MoonrakerClient:
     FRAME_ADVANCE_TIMEOUT = 2.5
     START_ADVANCE_TIMEOUT = 5.0
     ADVANCE_POLL_SECONDS = 0.25
+
+    def _resolve_webcam_snapshot_url(self) -> str:
+        """Snapshot URL of the Moonraker webcam service, or "" when none.
+
+        Extended-firmware printers run a camerastreamer service registered
+        as a Moonraker webcam (snapshot.jpg at real frame rates); stock
+        firmware registers none and only the repeater monitor exists.
+        Detected once and cached: the firmware flavor does not change
+        under a running client.
+        """
+        if self._webcam_snapshot_url is not None:
+            return self._webcam_snapshot_url
+        url = ""
+        result = self._get("/server/webcams/list")
+        for cam in (result or {}).get("webcams", []):
+            snapshot = cam.get("snapshot_url") or ""
+            if cam.get("enabled", True) and snapshot:
+                if snapshot.startswith("http"):
+                    url = snapshot
+                else:
+                    host = self.ip_address.split(":")[0]
+                    url = f"http://{host}{snapshot if snapshot.startswith('/') else '/' + snapshot}"
+                break
+        self._webcam_snapshot_url = url
+        return url
+
+    # Proof-of-life for the webcam path: an advance must be observed
+    # recently. Consecutive calls inside the window chain (each frame
+    # differing from the previously served one is an advance); a first
+    # call, or one after an idle gap, must watch the source advance
+    # within the call itself.
+    WEBCAM_PROOF_WINDOW_SECONDS = 5.0
+    WEBCAM_PROOF_GAP_SECONDS = 0.35
+
+    def _capture_via_webcam_service(self) -> bytes | None:
+        """One still from the webcam service, proven live or None.
+
+        A running camerastreamer re-encodes on every request, so even a
+        static scene yields different bytes each fetch (verified on
+        hardware). "Different from the previous call" is not proof: a
+        frozen service serves one cached frame that differs from
+        whatever was served hours ago. So freshness requires an advance
+        observed during this capture — two fetches with different
+        bytes — unless the previous served frame is still inside the
+        proof window, where one differing fetch chains the advance.
+        """
+        import hashlib
+
+        url = self._resolve_webcam_snapshot_url()
+        if not url:
+            return None
+
+        def fetch() -> tuple[bytes, str] | None:
+            frame = self._get_bytes(url)
+            if not self._is_complete_jpeg(frame):
+                return None
+            return frame, hashlib.sha1(frame).hexdigest()
+
+        first = fetch()
+        if first is None:
+            return None
+        frame, digest = first
+        now = time.monotonic()
+        chained = (
+            self._last_frame_hash is not None
+            and digest != self._last_frame_hash
+            and now - self._webcam_proven_at < self.WEBCAM_PROOF_WINDOW_SECONDS
+        )
+        if not chained:
+            time.sleep(self.WEBCAM_PROOF_GAP_SECONDS)
+            second = fetch()
+            if second is None or second[1] == digest:
+                logger.warning(f"[{self.serial_number}] webcam snapshot did not advance; treating as stale")
+                return None
+            frame, digest = second
+        self._last_frame_hash = digest
+        self._webcam_proven_at = time.monotonic()
+        return frame
 
     def _monitor_mtime(self) -> float | None:
         """Printer-side mtime of monitor.jpg, or None when the file is absent.
@@ -256,7 +338,9 @@ class MoonrakerClient:
         return None
 
     def capture_snapshot(self) -> bytes | None:
-        """Capture one fresh JPEG still via the repeater monitor, or None.
+        """Capture one fresh JPEG still, or None. Prefers the Moonraker
+        webcam service when the firmware registers one (extended firmware:
+        real frame rates); falls back to the repeater monitor on stock.
 
         "Fresh" is proven, not assumed: monitor.jpg's printer-side mtime must
         advance while we watch. If it does not (monitor stopped, or a
@@ -269,6 +353,12 @@ class MoonrakerClient:
         6-minute auto-stop) and never stops it explicitly: other viewers may
         be watching, and the firmware reaps an idle monitor itself.
         """
+        try:
+            frame = self._capture_via_webcam_service()
+            if frame is not None:
+                return frame
+        except Exception as e:
+            logger.debug(f"[{self.serial_number}] webcam snapshot unavailable, falling back to monitor: {e}")
         try:
             baseline = self._monitor_mtime()
             advanced: float | None = None
