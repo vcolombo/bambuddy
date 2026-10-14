@@ -73,7 +73,7 @@ class FakeMoonrakerClient(MoonrakerClient):
             return self.payloads["printer_info"]
         return {"status": self.payloads["status"]}
 
-    def _post_json(self, path, payload):
+    def _post_json(self, path, payload, timeout=30):
         self.posts.append((path, payload))
         return {"result": "ok"}
 
@@ -360,3 +360,30 @@ async def test_u1_completion_never_attempts_sd_card_delete():
         )
 
         mock_delete.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_finish_photo_plate_moves_never_fire_for_u1():
+    """Emit-side deny (domain model): the automatic finish-photo plate
+    restore/park compensates for Bambu end G-code. Adding send_gcode must
+    not silently enable that automatic motion on a Moonraker printer."""
+    import logging
+    from unittest.mock import MagicMock, patch
+
+    sent = []
+    client = FakeMoonrakerClient(ip_address="192.168.4.102", serial_number="U1TEST")
+    client._poll_once()
+    client.state.state = "FINISH"
+    client.send_gcode = MagicMock(side_effect=lambda g: sent.append(g) or True)
+
+    with patch("backend.app.main.printer_manager") as mock_pm:
+        mock_pm.get_client = MagicMock(return_value=client)
+        mock_pm.get_model = MagicMock(return_value="U1")
+
+        from backend.app.main import _park_plate_after_finish_photo, _restore_plate_for_finish_photo
+
+        logger = logging.getLogger("test")
+        assert await _restore_plate_for_finish_photo(1, 20.0, logger) is False
+        _park_plate_after_finish_photo(1, 20.0, logger)
+
+    assert sent == []

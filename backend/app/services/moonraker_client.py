@@ -98,10 +98,10 @@ class MoonrakerClient:
         with urllib.request.urlopen(url, timeout=15) as resp:
             return json.load(resp)["result"]
 
-    def _post_json(self, path: str, payload: dict[str, Any]) -> Any:
+    def _post_json(self, path: str, payload: dict[str, Any], timeout: float = 30) -> Any:
         data = json.dumps(payload).encode()
         req = urllib.request.Request(self.base_url + path, data=data, headers={"Content-Type": "application/json"})
-        with urllib.request.urlopen(req, timeout=30) as resp:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
             return json.load(resp).get("result")
 
     def _post_multipart(self, path: str, fields: dict[str, str], filename: str, data: bytes) -> Any:
@@ -286,6 +286,26 @@ class MoonrakerClient:
         except Exception as e:
             logger.warning(f"[{self.serial_number}] camera snapshot failed: {e}")
             return None
+
+    def send_gcode(self, gcode: str) -> bool:
+        """Send G-code script(s) to Klipper. Mirrors the Bambu contract:
+        True means dispatched, not completed. Homing and moves execute
+        synchronously inside Klipper's script processing, so the POST can
+        take as long as the motion itself — it runs on its own thread or
+        a 30s G28 would stall every (sync-in-async) route that calls this.
+        """
+        if not self.state.connected:
+            logger.warning("[%s] Cannot send G-code: not connected", self.serial_number)
+            return False
+
+        def _send() -> None:
+            try:
+                self._post_json("/printer/gcode/script", {"script": gcode}, timeout=180)
+            except Exception as e:
+                logger.warning(f"[{self.serial_number}] G-code failed ({gcode[:50]!r}): {e}")
+
+        threading.Thread(target=_send, daemon=True).start()
+        return True
 
     def _poll_once(self) -> bool:
         """Fetch status and fold it into ``self.state``. Returns reachability."""

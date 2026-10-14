@@ -6537,6 +6537,15 @@ async def _restore_plate_for_finish_photo(printer_id: int, max_z_height: float, 
     if client is None:
         return False
 
+    # Emit-side deny for Moonraker (domain model): this is automatic motion
+    # compensating for Bambu's end G-code plate drop. Snapmaker's end
+    # G-code has not been validated for it, so the finish photo is taken
+    # where the print ended instead of moving anything.
+    from backend.app.utils.printer_models import uses_moonraker_transport
+
+    if uses_moonraker_transport(printer_manager.get_model(printer_id)):
+        logger.debug("[PLATE-RESTORE] printer %s: Moonraker printer — skipping plate move", printer_id)
+        return False
     # Re-read state immediately before commanding motion. If the queue has
     # already started the next print, the printer is no longer ours to move.
     state = getattr(client, "state", None)
@@ -6578,6 +6587,10 @@ def _park_plate_after_finish_photo(printer_id: int, max_z_height: float, logger)
     state = getattr(client, "state", None) if client else None
     if client is None or state is None or state.state != "FINISH":
         return
+    from backend.app.utils.printer_models import uses_moonraker_transport
+
+    if uses_moonraker_transport(printer_manager.get_model(printer_id)):
+        return  # Emit-side deny: see _restore_plate_for_finish_photo.
     client.send_gcode(f"G90\nG1 Z{max_z_height + _PLATE_PARK_DROP_MM:.2f} F{_PLATE_RESTORE_FEEDRATE}")
     logger.debug("[PLATE-RESTORE] printer %s: plate returned to unload height", printer_id)
 

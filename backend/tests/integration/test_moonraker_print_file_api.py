@@ -42,7 +42,7 @@ class WireFakeClient(MoonrakerClient):
             return {"software_version": "test"}
         return {"status": self.payloads["status"]}
 
-    def _post_json(self, path, payload):
+    def _post_json(self, path, payload, timeout=30):
         self.calls.append((path, payload))
         return {"result": "ok"}
 

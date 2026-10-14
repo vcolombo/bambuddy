@@ -94,3 +94,33 @@ def test_manager_refuses_upload_for_bambu_models():
 def test_extension_matching_ignores_path_and_case():
     assert MoonrakerClient._extension("GCODES/Cube.GCODE") == ".gcode"
     assert MoonrakerClient._extension("noext") == ""
+
+
+def _wait_for_post(client, timeout=2.0):
+    import time
+
+    deadline = time.monotonic() + timeout
+    while not client.posts and time.monotonic() < deadline:
+        time.sleep(0.01)
+    return client.posts
+
+
+def test_send_gcode_posts_script_to_klipper():
+    client = _idle_client()
+    assert client.send_gcode("G28")
+    assert _wait_for_post(client) == [("/printer/gcode/script", {"script": "G28"})]
+
+
+def test_send_gcode_passes_multiline_jog_verbatim():
+    client = _idle_client()
+    assert client.send_gcode("G91\nG1 X10.00 F6000\nG90")
+    assert _wait_for_post(client) == [("/printer/gcode/script", {"script": "G91\nG1 X10.00 F6000\nG90"})]
+
+
+def test_send_gcode_refused_when_disconnected():
+    from backend.tests.unit.test_moonraker_u1 import FakeMoonrakerClient
+
+    client = FakeMoonrakerClient(ip_address="192.168.4.102", serial_number="U1TEST")
+    assert not client.state.connected
+    assert client.send_gcode("G28") is False
+    assert _wait_for_post(client, timeout=0.2) == []
