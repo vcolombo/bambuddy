@@ -38,6 +38,7 @@ CHAMBER_TEMP_SUPPORTED_MODELS = frozenset(
         "H2D",
         "H2DPRO",
         "H2S",  # H2 series
+        "U1",  # Snapmaker U1 cavity sensor (Moonraker; sensor only, no heater)
         # Internal codes (from MQTT/SSDP)
         "BL-P001",  # X1/X1C
         "C13",  # X1E

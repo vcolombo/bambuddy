@@ -129,35 +129,39 @@ def test_send_gcode_refused_when_disconnected():
 def test_concurrent_motion_is_refused_not_queued():
     # A second click while a home is executing must be refused outright:
     # queueing it would run a stale jog minutes later, after the user has
-    # long forgotten clicking it.
+    # long forgotten clicking it. Dispatch is synchronous, so the first
+    # send occupies its caller until Klipper finishes.
     import threading
-    import time
 
     client = _idle_client()
     release = threading.Event()
+    entered = threading.Event()
     posted = []
 
     def blocking_post(path, payload, timeout=30):
         posted.append(payload["script"])
+        entered.set()
         release.wait(timeout=5)
         return {"result": "ok"}
 
     client._post_json = blocking_post
-    assert client.send_gcode("G28") is True
+    results = []
+    home = threading.Thread(target=lambda: results.append(client.send_gcode("G28")))
+    home.start()
+    assert entered.wait(timeout=2)
     assert client.send_gcode("G91\nG1 X10 F6000\nG90") is False
     release.set()
-    deadline = time.monotonic() + 2.0
-    while client._gcode_in_flight and time.monotonic() < deadline:
-        time.sleep(0.01)
+    home.join(timeout=2)
+    assert results == [True]
     assert posted == ["G28"]
     assert client.send_gcode("G91\nG1 X10 F6000\nG90") is True
+    assert posted == ["G28", "G91\nG1 X10 F6000\nG90"]
 
 
-def test_failed_motion_releases_the_flight_slot():
-    # A POST that blows up (timeout, connection drop) must free the slot:
-    # the printer is not wedged out of motion controls until reconnect.
-    import time
-
+def test_failed_motion_propagates_and_releases_the_flight_slot():
+    # A POST that blows up (timeout, connection drop) surfaces as False —
+    # not dispatched-and-forgotten — and the printer is not wedged out
+    # of motion controls until reconnect.
     client = _idle_client()
     attempts = []
 
@@ -168,15 +172,44 @@ def test_failed_motion_releases_the_flight_slot():
         return {"result": "ok"}
 
     client._post_json = flaky_post
-    assert client.send_gcode("G28") is True
-    deadline = time.monotonic() + 2.0
-    accepted = False
-    while time.monotonic() < deadline and not accepted:
-        accepted = client.send_gcode("M115")
-        if not accepted:
-            time.sleep(0.01)
-    assert accepted
-    deadline = time.monotonic() + 2.0
-    while len(attempts) < 2 and time.monotonic() < deadline:
-        time.sleep(0.01)
+    assert client.send_gcode("G28") is False
+    assert client.send_gcode("M115") is True
     assert attempts == ["G28", "M115"]
+
+
+def test_pause_resume_use_moonraker_print_endpoints():
+    client = _idle_client()
+    assert client.pause_print()
+    assert client.resume_print()
+    assert client.posts == [("/printer/print/pause", {}), ("/printer/print/resume", {})]
+
+
+def test_temps_fans_and_light_map_to_klipper_commands():
+    client = _idle_client()
+    assert client.set_bed_temperature(60)
+    assert client.set_nozzle_temperature(210, 2)
+    assert client.set_fan_speed(1, 255)
+    assert client.set_fan_speed(3, 128)
+    assert client.set_chamber_light(True)
+    assert client.set_chamber_light(False)
+    scripts = [payload["script"] for _, payload in client.posts]
+    assert scripts == [
+        "M140 S60",
+        "M104 T2 S210",
+        "M106 S255",
+        "SET_FAN_SPEED FAN=cavity_fan SPEED=0.502",
+        "SET_LED LED=cavity_led WHITE=1.0",
+        "SET_LED LED=cavity_led WHITE=0.0",
+    ]
+    assert all(path == "/printer/gcode/script" for path, _ in client.posts)
+
+
+def test_unsupported_controls_deny_cleanly_without_emitting():
+    client = _idle_client()
+    assert client.set_nozzle_temperature(200, 4) is False  # only T0-T3 exist
+    assert client.set_fan_speed(2, 255) is False  # no aux fan on a U1
+    assert client.set_chamber_temperature(40) is False  # sensor + fan, no heater
+    assert client.set_print_speed(3) is False  # Bambu speed-level vocabulary
+    assert client.select_extruder(1) is False  # a toolchange, not a toggle
+    assert client.set_airduct_mode("cooling") is False
+    assert client.posts == []

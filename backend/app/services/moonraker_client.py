@@ -379,38 +379,48 @@ class MoonrakerClient:
             logger.warning(f"[{self.serial_number}] camera snapshot failed: {e}")
             return None
 
-    # Motion dispatch is single-flight: homing and moves execute
-    # synchronously inside Klipper's script processing, so the POST can
-    # take as long as the motion itself. One in-flight motion at a time,
-    # on its own thread — a second click is refused rather than queued,
-    # so no stale jog can execute minutes later behind a failed or
+    # Motion dispatch is single-flight and synchronous: homing and moves
+    # execute inside Klipper's script processing, so the POST takes as
+    # long as the motion itself (async callers offload it). A second
+    # motion while one is executing is refused rather than queued, so
+    # no stale jog can execute minutes later behind a failed or
     # disconnected home. There is deliberately no pending backlog.
-    def send_gcode(self, gcode: str) -> bool:
-        """Dispatch G-code script(s) to Klipper. Mirrors the Bambu
-        contract (True = dispatched, not completed), plus the
-        single-flight rule above: False while a previous motion is
-        still executing.
+    def _run_gcode(self, gcode: str, timeout: float = 30) -> bool:
+        """Run one script synchronously; False on any transport/Klipper error.
+
+        Klippy serializes scripts under its G-code mutex, so caller order
+        is execution order and a script behind a running home simply waits
+        its turn inside Klipper — the wait surfaces here as call duration,
+        which is why async callers must offload (the routes do).
         """
         if not self.state.connected:
             logger.warning("[%s] Cannot send G-code: not connected", self.serial_number)
             return False
+        try:
+            self._post_json("/printer/gcode/script", {"script": gcode}, timeout=timeout)
+        except Exception as e:
+            logger.warning(f"[{self.serial_number}] G-code failed ({gcode[:50]!r}): {e}")
+            return False
+        return True
+
+    def send_gcode(self, gcode: str) -> bool:
+        """Run motion G-code to completion. Unlike Bambu's publish, this
+        returns only when Klipper has finished the script (a G28 takes as
+        long as it takes), and False means it failed or another motion is
+        already executing — motion is single-flight with no backlog, so
+        nothing stale can execute behind a failed or disconnected home.
+        Blocking: async callers must offload (the routes do).
+        """
         with self._gcode_lock:
             if self._gcode_in_flight:
                 logger.warning("[%s] G-code refused: motion already in flight", self.serial_number)
                 return False
             self._gcode_in_flight = True
-
-        def _send() -> None:
-            try:
-                self._post_json("/printer/gcode/script", {"script": gcode}, timeout=180)
-            except Exception as e:
-                logger.warning(f"[{self.serial_number}] G-code failed ({gcode[:50]!r}): {e}")
-            finally:
-                with self._gcode_lock:
-                    self._gcode_in_flight = False
-
-        threading.Thread(target=_send, daemon=True).start()
-        return True
+        try:
+            return self._run_gcode(gcode, timeout=180)
+        finally:
+            with self._gcode_lock:
+                self._gcode_in_flight = False
 
     def _poll_once(self) -> bool:
         """Fetch status and fold it into ``self.state``. Returns reachability."""
@@ -424,6 +434,10 @@ class MoonrakerClient:
                     "virtual_sdcard": "",
                     "toolhead": "",
                     "heater_bed": "",
+                    "fan": "",
+                    "fan_generic cavity_fan": "",
+                    "led cavity_led": "",
+                    "temperature_sensor cavity": "",
                     **dict.fromkeys(TOOLS.values(), ""),
                 },
             )
@@ -450,6 +464,9 @@ class MoonrakerClient:
             tuple(sorted((s.temperatures or {}).items())),
             s.active_extruder,
             s.firmware_version,
+            s.chamber_light,
+            s.cooling_fan_speed,
+            s.big_fan2_speed,
         )
 
     def _apply(self, info: dict[str, Any], s: dict[str, Any]) -> None:
@@ -501,8 +518,16 @@ class MoonrakerClient:
         bed = s.get("heater_bed", {})
         temps["bed"] = bed.get("temperature", 0.0)
         temps["bed_target"] = bed.get("target", 0.0)
+        cavity = s.get("temperature_sensor cavity", {})
+        if cavity.get("temperature") is not None:
+            temps["chamber"] = cavity["temperature"]
+            temps["chamber_target"] = 0.0  # sensor only; no chamber heater
         state.temperatures = temps
         state.active_extruder = int(active_tool[1:])
+        state.cooling_fan_speed = round(float(s.get("fan", {}).get("speed") or 0.0) * 100)
+        state.big_fan2_speed = round(float(s.get("fan_generic cavity_fan", {}).get("speed") or 0.0) * 100)
+        color_data = s.get("led cavity_led", {}).get("color_data") or []
+        state.chamber_light = any(any(channel > 0 for channel in led) for led in color_data)
 
     def _active_tool_index(self, klippy_name: str) -> str:
         for tool, name in TOOLS.items():
@@ -703,3 +728,76 @@ class MoonrakerClient:
             logger.warning(f"[{self.serial_number}] cancel failed: {e}")
             return False
         return True
+
+    # --- Print controls (user-initiated card buttons) ---
+
+    def pause_print(self) -> bool:
+        try:
+            self._post_json("/printer/print/pause", {})
+        except Exception as e:
+            logger.warning(f"[{self.serial_number}] pause failed: {e}")
+            return False
+        return True
+
+    def resume_print(self) -> bool:
+        try:
+            self._post_json("/printer/print/resume", {})
+        except Exception as e:
+            logger.warning(f"[{self.serial_number}] resume failed: {e}")
+            return False
+        return True
+
+    def _send_instant_gcode(self, gcode: str) -> bool:
+        """Run a non-motion script (temps, fans, LED) synchronously.
+
+        Not motion-guarded: a heater click during a home queues inside
+        Klippy behind the running script (shared G-code mutex) and this
+        call simply takes that long — it is never reordered ahead of the
+        home, and never dispatched-and-forgotten. Failures propagate as
+        False. Blocking: async callers must offload (the routes do).
+        """
+        return self._run_gcode(gcode, timeout=30)
+
+    def set_bed_temperature(self, target: int) -> bool:
+        return self._send_instant_gcode(f"M140 S{target}")
+
+    def set_nozzle_temperature(self, target: int, nozzle: int = 0) -> bool:
+        if not 0 <= nozzle <= 3:
+            logger.warning("[%s] Nozzle %s out of range for a 4-tool machine", self.serial_number, nozzle)
+            return False
+        return self._send_instant_gcode(f"M104 T{nozzle} S{target}")
+
+    def set_fan_speed(self, fan: int, speed: int) -> bool:
+        """Bambu fan ids: 1=part, 2=aux, 3=chamber, 10=left aux (accessory).
+        The U1 has a part fan per tool (M106 addresses the active tool's)
+        and a cavity exhaust fan; there is no aux fan to drive.
+        """
+        if fan == 1:
+            return self._send_instant_gcode(f"M106 S{speed}")
+        if fan == 3:
+            return self._send_instant_gcode(f"SET_FAN_SPEED FAN=cavity_fan SPEED={speed / 255:.3f}")
+        return False
+
+    def set_chamber_fan(self, speed: int) -> bool:
+        return self._send_instant_gcode(f"SET_FAN_SPEED FAN=cavity_fan SPEED={speed / 255:.3f}")
+
+    def set_chamber_light(self, on: bool) -> bool:
+        return self._send_instant_gcode(f"SET_LED LED=cavity_led WHITE={1.0 if on else 0.0}")
+
+    # Clean denials (route answers 500 "failed", never AttributeError):
+    # chamber heat has no heater to drive (sensor + fan only; the route
+    # also gates on supports_chamber_heater), print-speed levels are a
+    # Bambu vocabulary with no validated Klipper mapping yet, tool
+    # selection is a toolchange (filament-mapping track, not a toggle),
+    # and there is no airduct.
+    def set_chamber_temperature(self, target: int) -> bool:
+        return False
+
+    def set_print_speed(self, mode: int) -> bool:
+        return False
+
+    def select_extruder(self, extruder: int) -> bool:
+        return False
+
+    def set_airduct_mode(self, mode: str) -> bool:
+        return False

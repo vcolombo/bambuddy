@@ -46,6 +46,10 @@ def _status(print_state="standby", filename="", progress=0.0, layer=0, total=0, 
         "virtual_sdcard": {"is_active": False},
         "toolhead": {"extruder": active},
         "heater_bed": {"temperature": 24.0, "target": 0.0},
+        "fan": {"speed": 0.5, "rpm": 4000},
+        "fan_generic cavity_fan": {"speed": 0.25, "rpm": 1200},
+        "led cavity_led": {"color_data": [[0.0, 0.0, 0.0, 1.0]]},
+        "temperature_sensor cavity": {"temperature": 32.0},
         **extruders,
     }
 
@@ -111,6 +115,10 @@ def test_idle_maps_to_bambuddy_idle_with_four_tool_temps():
     assert state.state == "IDLE"
     assert state.temperatures["nozzle"] == 27.0
     assert state.temperatures["bed"] == 24.0
+    assert state.temperatures["chamber"] == 32.0
+    assert state.cooling_fan_speed == 50
+    assert state.big_fan2_speed == 25
+    assert state.chamber_light is True
     assert state.firmware_version == "2.0.0.205_20260914173503"
 
 
@@ -387,3 +395,100 @@ async def test_finish_photo_plate_moves_never_fire_for_u1():
         _park_plate_after_finish_photo(1, 20.0, logger)
 
     assert sent == []
+
+
+@pytest.mark.asyncio
+async def test_automatic_plate_check_emits_nothing_for_u1():
+    """Emit-side deny (domain model): the automatic plate check switches
+    the chamber light and can pause the print. With plate detection
+    enabled on a U1 it must not run at all — no detection call, no
+    light, no pause. Mirrors the harness in test_plate_check_chamber_light.
+    """
+    from types import SimpleNamespace
+    from unittest.mock import AsyncMock, MagicMock, patch
+
+    from backend.app.main import (
+        _active_prints,
+        _expected_print_creators,
+        _expected_print_registered_at,
+        _expected_prints,
+        _print_ams_mappings,
+        _timelapse_baselines,
+    )
+
+    for d in (
+        _active_prints,
+        _expected_prints,
+        _expected_print_creators,
+        _expected_print_registered_at,
+        _print_ams_mappings,
+        _timelapse_baselines,
+    ):
+        d.clear()
+
+    events: list[str] = []
+    printer = MagicMock()
+    printer.id = 1
+    printer.name = "Snapmaker U1"
+    printer.model = "U1"
+    printer.plate_detection_enabled = True
+    printer.plate_detection_roi_x = None
+    printer.plate_detection_roi_y = None
+    printer.plate_detection_roi_w = None
+    printer.plate_detection_roi_h = None
+    printer.auto_archive = False
+    printer.external_camera_enabled = False
+    printer.external_camera_url = None
+
+    client = MagicMock()
+    client.state = SimpleNamespace(chamber_light=False)
+    client.set_chamber_light = MagicMock(side_effect=lambda on: events.append(f"light:{'on' if on else 'off'}"))
+    client.pause_print = MagicMock(side_effect=lambda: events.append("pause"))
+
+    check_plate_empty = AsyncMock(
+        return_value=SimpleNamespace(needs_calibration=False, is_empty=False, confidence=0.9, difference_percent=12.0)
+    )
+
+    def execute_router(stmt, *args, **kwargs):
+        found = printer if "from printers" in str(stmt).lower() else None
+        return MagicMock(
+            scalar_one_or_none=MagicMock(return_value=found),
+            scalars=MagicMock(return_value=MagicMock(all=MagicMock(return_value=[found] if found else []))),
+        )
+
+    session = AsyncMock()
+    session.__aenter__ = AsyncMock(return_value=session)
+    session.__aexit__ = AsyncMock()
+    session.execute = AsyncMock(side_effect=execute_router)
+
+    with (
+        patch("backend.app.main.async_session", return_value=session),
+        patch("backend.app.main.notification_service") as mock_notif,
+        patch("backend.app.main.smart_plug_manager") as mock_plug,
+        patch("backend.app.main.ws_manager") as mock_ws,
+        patch("backend.app.main.printer_manager") as mock_pm,
+        patch("backend.app.main.mqtt_relay") as mock_relay,
+        patch("backend.app.main.asyncio.sleep", new_callable=AsyncMock),
+        patch("backend.app.main._capture_snapshot_for_notification", new_callable=AsyncMock, return_value=b"jpeg"),
+        patch("backend.app.main._record_energy_start", new_callable=AsyncMock),
+        patch("backend.app.main._load_objects_from_archive"),
+        patch("backend.app.main._store_spoolman_print_data", new_callable=AsyncMock),
+        patch("backend.app.main._send_print_start_notification", new_callable=AsyncMock),
+        patch("backend.app.services.plate_detection.check_plate_empty", check_plate_empty),
+    ):
+        mock_notif.on_plate_not_empty = AsyncMock()
+        mock_notif.on_print_start = AsyncMock()
+        mock_plug.on_print_start = AsyncMock()
+        mock_ws.broadcast = AsyncMock()
+        mock_ws.send_print_start = AsyncMock()
+        mock_ws.send_archive_updated = AsyncMock()
+        mock_relay.on_print_start = AsyncMock()
+        mock_pm.get_client = MagicMock(return_value=client)
+        mock_pm.get_printer = MagicMock(return_value=MagicMock(name="Snapmaker U1", serial_number="U1TEST"))
+
+        from backend.app.main import on_print_start
+
+        await on_print_start(1, {"filename": "cube.gcode", "subtask_name": "cube.gcode"})
+
+    check_plate_empty.assert_not_called()
+    assert events == []

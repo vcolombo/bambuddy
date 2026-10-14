@@ -4093,7 +4093,19 @@ async def on_print_start(printer_id: int, data: dict):
         logger.info(
             f"[PLATE CHECK] printer_id={printer_id}, plate_detection_enabled={printer.plate_detection_enabled if printer else 'NO PRINTER'}"
         )
-        if printer and printer.plate_detection_enabled:
+        # Emit-side deny for Moonraker (domain model): this automatic path
+        # switches the chamber light and can pause the print, on top of a
+        # Bambu-shaped capture pipeline. None of that is validated for a
+        # Klipper machine, so the whole check is skipped, not just its
+        # emits. User-initiated light/pause controls remain available.
+        from backend.app.utils.printer_models import uses_moonraker_transport
+
+        if printer and printer.plate_detection_enabled and uses_moonraker_transport(printer.model):
+            logger.info(
+                "[PLATE CHECK] printer %s: Moonraker printer — automatic plate check not supported, skipping",
+                printer_id,
+            )
+        elif printer and printer.plate_detection_enabled:
             logger.info("[PLATE CHECK] ENTERING plate detection code for printer %s", printer_id)
             # Release the pooled DB connection before the plate-detection camera
             # work (a 2.5s light-settle sleep + FTP/camera capture). Only the

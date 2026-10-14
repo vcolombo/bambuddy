@@ -3657,7 +3657,7 @@ async def stop_print(
     if not client:
         raise HTTPException(400, "Printer not connected")
 
-    success = client.stop_print()
+    success = await asyncio.to_thread(client.stop_print)
     if not success:
         raise HTTPException(500, "Failed to stop print")
 
@@ -3746,7 +3746,7 @@ async def pause_print(
     if not client:
         raise HTTPException(400, "Printer not connected")
 
-    success = client.pause_print()
+    success = await asyncio.to_thread(client.pause_print)
     if not success:
         raise HTTPException(500, "Failed to pause print")
 
@@ -3769,7 +3769,7 @@ async def resume_print(
     if not client:
         raise HTTPException(400, "Printer not connected")
 
-    success = client.resume_print()
+    success = await asyncio.to_thread(client.resume_print)
     if not success:
         raise HTTPException(500, "Failed to resume print")
 
@@ -3805,7 +3805,7 @@ async def set_print_speed(
 async def set_nozzle_temperature(
     printer_id: int,
     target: int = Query(..., ge=0, le=320, description="Target nozzle temperature in Celsius; 0 turns heating off"),
-    nozzle: int = Query(0, ge=0, le=1, description="Nozzle/extruder index (0=right/default, 1=left)"),
+    nozzle: int = Query(0, ge=0, le=3, description="Nozzle/extruder index (Bambu 0=right, 1=left; U1 toolheads 0-3)"),
     _=RequirePermissionIfAuthEnabled(Permission.PRINTERS_CONTROL),
     db: AsyncSession = Depends(get_db),
 ):
@@ -3815,11 +3815,18 @@ async def set_nozzle_temperature(
     if not printer:
         raise HTTPException(404, "Printer not found")
 
+    # Model-appropriate bound: Bambu dual-nozzle is 0-1, the U1 toolchanger
+    # is T0-T3. The card submits the active extruder, which a flat le=1
+    # rejected with a 422 whenever T2/T3 was active on the U1.
+    max_nozzle = 3 if uses_moonraker_transport(printer.model) else 1
+    if nozzle > max_nozzle:
+        raise HTTPException(400, f"Nozzle index {nozzle} does not exist on model {printer.model or 'unknown'}")
+
     client = printer_manager.get_client(printer_id)
     if not client:
         raise HTTPException(400, "Printer not connected")
 
-    success = client.set_nozzle_temperature(target, nozzle)
+    success = await asyncio.to_thread(client.set_nozzle_temperature, target, nozzle)
     if not success:
         raise HTTPException(500, "Failed to set nozzle temperature")
 
@@ -3843,7 +3850,7 @@ async def set_bed_temperature(
     if not client:
         raise HTTPException(400, "Printer not connected")
 
-    success = client.set_bed_temperature(target)
+    success = await asyncio.to_thread(client.set_bed_temperature, target)
     if not success:
         raise HTTPException(500, "Failed to set bed temperature")
 
@@ -3881,7 +3888,7 @@ async def set_chamber_temperature(
     if not client:
         raise HTTPException(400, "Printer not connected")
 
-    success = client.set_chamber_temperature(target)
+    success = await asyncio.to_thread(client.set_chamber_temperature, target)
     if not success:
         raise HTTPException(500, "Failed to set chamber temperature")
 
@@ -3935,7 +3942,7 @@ async def set_fan_speed(
         )
 
     pwm_speed = round(speed * 255 / 100)
-    success = client.set_fan_speed(fan_id, pwm_speed)
+    success = await asyncio.to_thread(client.set_fan_speed, fan_id, pwm_speed)
     if not success:
         raise HTTPException(500, "Failed to set fan speed")
 
@@ -4019,7 +4026,7 @@ async def set_chamber_light(
     if not client:
         raise HTTPException(400, "Printer not connected")
 
-    success = client.set_chamber_light(on)
+    success = await asyncio.to_thread(client.set_chamber_light, on)
     if not success:
         raise HTTPException(500, "Failed to control chamber light")
 
@@ -4108,7 +4115,7 @@ async def bed_jog(
     # M211 S0 disabled them globally, taking the touchscreen's limits with it.
     lines = ["G91", f"G1 Z{distance:.2f} F600", "G90"]
 
-    if not client.send_gcode("\n".join(lines)):
+    if not await asyncio.to_thread(client.send_gcode, "\n".join(lines)):
         raise HTTPException(500, "Failed to send bed-jog command")
 
     return {"success": True, "message": f"Bed jog {distance:+.1f} mm sent"}
@@ -4144,7 +4151,7 @@ async def xy_jog(
     # Bare relative move, never M211 (#2579) — see the bed-jog docstring. The
     # firmware does not enforce soft endstops on MQTT G-code, so this move is
     # unguarded; M211 S0 only widened that to the touchscreen as well.
-    if not client.send_gcode("\n".join(["G91", f"G1 {' '.join(axes)} F6000", "G90"])):
+    if not await asyncio.to_thread(client.send_gcode, "\n".join(["G91", f"G1 {' '.join(axes)} F6000", "G90"])):
         raise HTTPException(500, "Failed to send XY jog command")
 
     return {"success": True, "message": f"XY jog X{x:+.1f} Y{y:+.1f} mm sent"}
@@ -4177,7 +4184,7 @@ async def extruder_jog(
     if not client:
         raise HTTPException(400, "Printer not connected")
 
-    if not client.send_gcode("\n".join(["M83", f"G1 E{distance:.2f} F300", "M82"])):
+    if not await asyncio.to_thread(client.send_gcode, "\n".join(["M83", f"G1 E{distance:.2f} F300", "M82"])):
         raise HTTPException(500, "Failed to send extruder jog command")
 
     return {"success": True, "message": f"Extruder jog {distance:+.1f} mm sent"}
@@ -4221,7 +4228,7 @@ async def home_axes(
     if not client:
         raise HTTPException(400, "Printer not connected")
 
-    if not client.send_gcode("G28"):
+    if not await asyncio.to_thread(client.send_gcode, "G28"):
         raise HTTPException(500, "Failed to send home command")
 
     return {"success": True, "message": "Full auto-home sequence sent"}

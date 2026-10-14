@@ -185,3 +185,27 @@ class TestMoonrakerDispatchLoopLiveness:
             assert sleep_elapsed < 2.0, f"loop stalled {sleep_elapsed:.1f}s behind upload"
         finally:
             del client.upload_gcode
+
+
+class TestMoonrakerNozzleBounds:
+    """The card submits status.active_extruder; T2/T3 must not 422 on a U1."""
+
+    @pytest.mark.asyncio
+    @pytest.mark.integration
+    async def test_t3_nozzle_temperature_accepted_on_u1(self, async_client: AsyncClient, printer_factory, u1_wire):
+        printer = await printer_factory(model="U1", access_code="")
+        client = u1_wire(printer.id)
+        response = await async_client.post(f"/api/v1/printers/{printer.id}/temperature/nozzle?target=210&nozzle=3")
+        assert response.status_code == 200, response.text
+        assert ("/printer/gcode/script", {"script": "M104 T3 S210"}) in client.calls
+
+    @pytest.mark.asyncio
+    @pytest.mark.integration
+    async def test_nozzle_bounds_stay_model_appropriate(self, async_client: AsyncClient, printer_factory, u1_wire):
+        u1 = await printer_factory(model="U1", access_code="")
+        u1_wire(u1.id)
+        too_far = await async_client.post(f"/api/v1/printers/{u1.id}/temperature/nozzle?target=210&nozzle=4")
+        assert too_far.status_code == 422
+        bambu = await printer_factory(model="P1S")
+        dual_only = await async_client.post(f"/api/v1/printers/{bambu.id}/temperature/nozzle?target=210&nozzle=2")
+        assert dual_only.status_code == 400
